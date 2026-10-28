@@ -8,6 +8,18 @@ number (`GET /v1`, [PROTOCOL.md](PROTOCOL.md)) changes only when a client would 
 
 The first version in a repository of its own (until now it came inside fedtail's).
 
+- **Protocol 2: a journal is its key's.** The devices derive from the key a journal id and a
+  secret (`X-Fedtail-Journal`, `Authorization: Bearer`); the key never comes here, and no
+  fediverse server is asked anything — the `read:accounts` token, `instances`, the token
+  checks and their limits are gone (an older config still starts: they are said and
+  ignored). Paths under `/v2`; `GET /v1` answers protocol 2, so an older client stops.
+- **Invite codes**: a journal is made only with one (`X-Fedtail-Invite`), at most
+  `new_journals_per_minute_per_ip`. `invite add <name> [code]`, `invite list`,
+  `invite revoke <name>` on the command line; a code is shown once, only its hash kept;
+  taken back, it takes the journals made with it away.
+- The key under a password apart from the journal: `PUT/GET /v2/escrow/<id>`, the id
+  derived from the password, asked at most `escrow_gets_per_minute_per_ip`.
+- The journals of protocol 1 are dropped at the first start.
 - A device packs its own journal: `DELETE /v1/devices/<device>?before=N` drops that
   device's blobs older than its snapshot (protocol 1 still — `GET /v1` says `compact`), and
   the quota they took is free again. The others' blobs are never touched.

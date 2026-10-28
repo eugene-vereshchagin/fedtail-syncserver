@@ -1,6 +1,7 @@
 """What the tests share: the server module loaded from its file, a temporary folder, a
-live server on a free port with a counting fake for the token check, and raw sockets."""
+live server on a free port with an invite code made, journals by name, and raw sockets."""
 
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -12,7 +13,23 @@ import unittest
 from pathlib import Path
 
 SERVER_FILE = Path(__file__).resolve().parent.parent / "fedtail_sync.py"
-GOOD = {"t-me": "1", "t-me2": "1", "t-you": "2"}  # token → account id at me.example
+# a "token" of the tests names a device's journal: t-me and t-me2 — two devices of one
+# key; t-you — another; anything else — my journal with a wrong secret
+GOOD = {"t-me": "me", "t-me2": "me", "t-you": "you"}
+CODE = "TEST-CODE-0001"
+
+
+def creds(token):
+    """(journal id, secret) a device with this "token" derives from its key."""
+    name = GOOD.get(token, "me")
+    jid = hashlib.sha256(f"j:{name}".encode()).hexdigest()[:32]
+    secret = hashlib.sha256(f"s:{name}".encode()).hexdigest()
+    if token not in GOOD:
+        secret = hashlib.sha256(f"wrong:{token}".encode()).hexdigest()
+    return jid, secret
+
+
+ME, YOU = creds("t-me")[0], creds("t-you")[0]  # the journals' ids
 
 
 def load_server():
@@ -35,17 +52,15 @@ class Tmp(unittest.TestCase):
 
 
 class Live(Tmp):
-    """A server with the options given; `self.calls` — the tokens it checked."""
+    """A server with the options given and an invite code (CODE) to make journals."""
 
-    def start(self, verify=None, **cfg):
-        self.calls = []
-
-        def fake(host, token):
-            self.calls.append(token)
-            return GOOD.get(token)
-        conf = {"db": str(self.tmp / "s.db"), "instances": ["me.example"],
-                "listen": "127.0.0.1:0", **cfg}
-        self.app = self.mod.Server(conf, verify=verify or fake)
+    def start(self, **cfg):
+        conf = {"db": str(self.tmp / "s.db"), "listen": "127.0.0.1:0", **cfg}
+        self.app = self.mod.Server(conf)
+        try:
+            self.app.invite_add("tests", CODE)
+        except ValueError:  # started again over the same database: it is there
+            pass
         self.addCleanup(self.app.db.close)
         self.httpd = self.mod.make_http_server(self.app)
         self.port = self.httpd.server_address[1]
@@ -54,13 +69,19 @@ class Live(Tmp):
         self.addCleanup(self.httpd.shutdown)
         return self.app
 
-    def call(self, method, path, token=None, body=None, headers=None,
-             instance="https://me.example"):
+    def call(self, method, path, token=None, body=None, headers=None, invite=CODE):
+        """path "/v1/…" is asked as "/v2/…" (the tests were written for protocol 1);
+        token: whose journal (GOOD), its invite sent along unless invite is None."""
+        if path.startswith("/v1/"):
+            path = "/v2/" + path[len("/v1/"):]
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         h = dict(headers or {})
         if token:
-            h.setdefault("Authorization", f"Bearer {token}")
-            h.setdefault("X-Fedtail-Instance", instance)
+            jid, secret = creds(token)
+            h.setdefault("Authorization", f"Bearer {secret}")
+            h.setdefault("X-Fedtail-Journal", jid)
+            if invite:
+                h.setdefault("X-Fedtail-Invite", invite)
         c.request(method, path, body=body, headers=h)
         r = c.getresponse()
         data = r.read()

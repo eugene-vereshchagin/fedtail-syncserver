@@ -2,92 +2,89 @@
 
 A small HTTP server on the standard library alone: one file, Python 3.11+, SQLite. It
 keeps sealed blobs — each device's journal of read marks and thread states — and hands
-an account's blobs to its other devices. It can't read them: they are encrypted with a
-key only the devices have. All it learns is whose they are, how big and when.
+a journal's blobs to its other devices. It can't read them: they are encrypted with a
+key only the devices have. All it learns is how big they are and when.
 
-Whose: a device sends a token of its fediverse account limited to `read:accounts` (all
-it allows is "who am I") and names its server; this server asks that server who the
-token belongs to (`/api/v1/accounts/verify_credentials`) and files the blobs under the
-answer. No accounts or passwords of its own. Which servers' people it serves is a list
-in the config — "*" for anyone.
+Whose: a journal is its key's. The devices derive from the key a journal id and a secret
+(the key itself never comes here); whoever has the key has the journal. A journal is made
+only with an invite code the admin gave (`invite add <name>`), and a code taken back
+(`invite revoke <name>`) takes the journals made with it away — no accounts, no
+passwords, no fediverse server asked anything.
 
-    python3 fedtail_sync.py --config /etc/fedtail-sync.toml
-    python3 fedtail_sync.py --listen 127.0.0.1:8471 --db sync.db --instance my.server
+    python3 fedtail_sync.py --config /etc/fedtail-sync.toml        # serve
+    python3 fedtail_sync.py --config … invite add anna             # a code for Anna
+    python3 fedtail_sync.py --config … invite list
+    python3 fedtail_sync.py --config … invite revoke anna          # and her journals
 
 It lives apart from the fedtail package on purpose: an admin copies this one file to
 the server, nothing else of fedtail is needed there.
 
-Behind nginx/Caddy or a Cloudflare tunnel for TLS, on a name of its own: it is a
-service apart from the fediverse server, and fedtail finds it only by the address the
-user puts in sync.url. README.md (next to this file) has the config, a systemd unit,
-the proxy lines; PROTOCOL.md what it speaks.
+Behind nginx/Caddy or a Cloudflare tunnel for TLS, on a name of its own: fedtail finds
+it only by the address the user puts in sync.url. README.md (next to this file) has the
+config, a systemd unit, the proxy lines; PROTOCOL.md what it speaks.
 
 It faces the internet, so it guards itself (each a config option, README.md):
 a connection is dropped after `timeout_seconds` of silence and only `max_connections`
-are served at once; every client address has `requests_per_minute_per_ip`, and the
-token checks it causes — calls to someone's fediverse server — are capped per address
-and in all (`verifications_per_minute_per_ip`, `verifications_per_minute`), so it can
-be made neither to hang nor to hammer a server; bodies are read only with an honest
-Content-Length; the token check follows no redirect and, for "*", talks only to public
-addresses (checked on the connected socket, not just the name); the disk is capped per
-account (`quota_mb`) and in all (`total_mb`); the pictures of drafts have their own
-size, quota and pace (`max_media_kb`, `media_quota_mb`, `media_per_minute`) — past the
-quota the least used ones go, so a loop making drafts churns only its own. Behind a
-proxy on the same machine (cloudflared, nginx), `client_ip_header` names the header with
-the real address — believed only from a loopback peer.
+are served at once; every client address has `requests_per_minute_per_ip`, every
+journal `requests_per_minute`, and new journals `new_journals_per_minute_per_ip`;
+bodies are read only with an honest Content-Length; the disk is capped per journal
+(`quota_mb`) and in all (`total_mb`); the pictures of drafts have their own size, quota
+and pace (`max_media_kb`, `media_quota_mb`, `media_per_minute`) — past the quota the least
+used ones go, so a loop making drafts churns only its own; the key under a password is
+asked for at `escrow_gets_per_minute_per_ip`. Behind a proxy on the same machine
+(cloudflared, nginx), `client_ip_header` names the header with the real address —
+believed only from a loopback peer.
 
-API (JSON; every call but the first needs the token):
+API (JSON; PROTOCOL.md — every call but the first two names its journal):
 
-    GET    /v1                         {"fedtail-sync": version}
-    POST   /v1/blobs                   body: one blob; X-Fedtail-Device → {"seq": n}
-    GET    /v1/blobs?after=N&limit=M&exclude=DEVICE
+    GET    /v2                         {"fedtail-sync": 2, …what it keeps}
+    POST   /v2/blobs                   body: one blob; X-Fedtail-Device → {"seq": n}
+    GET    /v2/blobs?after=N&limit=M&exclude=DEVICE
                                        {"blobs": [{"seq", "device", "data": base64}],
                                         "last": N, "more": bool}
-    DELETE /v1/blobs                   the account's journal (and pictures) gone
-                                       → {"deleted": n}
-    PUT    /v1/media/<name>            body: one sealed picture of a draft → {"stored"}
-    GET    /v1/media/<name>            its bytes
-    DELETE /v1/media/<name>            → {"deleted": 0 | 1}
+    DELETE /v2/blobs                   the journal (its pictures, its key) gone
+    DELETE /v2/devices/<d>?before=N    that device's older blobs gone (a snapshot sent)
+    PUT    /v2/media/<name>            body: one sealed picture of a draft → {"stored"}
+    GET    /v2/media/<name>            its bytes
+    DELETE /v2/media/<name>            → {"deleted": 0 | 1}
+    PUT    /v2/escrow/<id>             the key sealed by a password (one per journal)
+    GET    /v2/escrow/<id>             its bytes — no journal named: that's what it's for
 """
 
 import argparse
 import base64
 import hashlib
-import http.client
 import ipaddress
 import json
 import logging
 import re
+import secrets
 import socket
 import sqlite3
-import ssl
 import threading
 import time
 import tomllib
-import urllib.error
-import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 __version__ = "0.22.0.dev0"  # the same as fedtail's: they are released together
-VERSION = 1            # the protocol (GET /v1 says it); a client checks this one
+VERSION = 2            # the protocol (GET /v2 says it); a client checks this one
 log = logging.getLogger("fedtail-sync")
 
 DEFAULTS = {
     "listen": "127.0.0.1:8471",
     "db": "fedtail-sync.db",
-    "instances": [],            # hosts whose accounts are served; ["*"] — any
-    "quota_mb": 20,             # per account
+    "quota_mb": 20,             # per journal
     "max_blob_kb": 512,
-    "requests_per_minute": 120,  # per account
-    "keep_days": 0,             # 0: blobs are kept until the account deletes them
-    "total_mb": 1024,           # all accounts together; 0 — no cap
+    "requests_per_minute": 120,  # per journal
+    "keep_days": 0,             # 0: blobs are kept until the journal is deleted
+    "total_mb": 1024,           # all journals together; 0 — no cap
     "timeout_seconds": 30,      # a silent connection is dropped after this
     "max_connections": 64,      # served at once; more are closed at the door
     "requests_per_minute_per_ip": 240,
-    "verifications_per_minute_per_ip": 10,  # token checks at a fediverse server
-    "verifications_per_minute": 60,         # … in all
+    "new_journals_per_minute_per_ip": 3,   # journals made (each needs an invite code)
+    "escrow_gets_per_minute_per_ip": 5,    # the key under a password asked for
     "client_ip_header": "",     # e.g. "CF-Connecting-IP"; believed from loopback only
     # the pictures of drafts (sealed like the blobs): one at most max_media_kb; an
     # account keeps media_quota_mb of them — the least used go first to make room, so no
@@ -95,7 +92,7 @@ DEFAULTS = {
     "max_media_kb": 4096,
     "media_quota_mb": 50,       # 0 — no pictures here
     "media_keep_days": 30,
-    "media_per_minute": 30,     # per account
+    "media_per_minute": 30,     # per journal
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS blobs (
@@ -114,93 +111,46 @@ CREATE TABLE IF NOT EXISTS media (
     PRIMARY KEY (account, name)
 );
 CREATE INDEX IF NOT EXISTS media_used ON media (account, at);
+-- a journal is its key's: the id and a hash of the secret the devices derive from it,
+-- and the invite it was made with (taken back — the journal goes)
+CREATE TABLE IF NOT EXISTS journals (
+    id      TEXT PRIMARY KEY,
+    secret  TEXT NOT NULL,
+    invite  TEXT NOT NULL,
+    made    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invites (
+    name    TEXT PRIMARY KEY,
+    code    TEXT NOT NULL UNIQUE,   -- sha256 of the code: the code itself is shown once
+    made    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS escrow (
+    id      TEXT PRIMARY KEY,       -- derived from a password by the client
+    journal TEXT NOT NULL UNIQUE,
+    data    BLOB NOT NULL
+);
 """
-# options of older versions: public_url fed /.well-known/fedtail-sync, gone with
-# fedtail 0.19 (it no longer looks the server up)
-RETIRED = {"public_url"}
-RETIRED_WHY = "no more /.well-known: fedtail takes the address from sync.url"
-TOKEN_TTL = 600      # a verified token is believed this long, seconds
-REFUSED_TTL = 60     # a refused one is refused without asking again this long
+# options of older versions, said and ignored: public_url fed /.well-known/fedtail-sync
+# (gone with fedtail 0.19); the fediverse token check went with protocol 2 (0.22)
+RETIRED = {"public_url": "no more /.well-known: fedtail takes the address from sync.url",
+           "instances": "protocol 2: a journal is its key's, made with an invite code",
+           "verifications_per_minute_per_ip": "protocol 2: no token checks any more",
+           "verifications_per_minute": "protocol 2: no token checks any more"}
 PAGE_MAX = 500
 SEQ_MAX = 2 ** 62    # beyond any real sequence; bigger numbers are nonsense
 DEVICE_RE = re.compile(r"^[A-Za-z0-9_-]{0,32}$")
 MEDIA_RE = re.compile(r"^[0-9a-f]{32,64}$")  # a picture's name: the client's keyed hash
-VERIFY_TIMEOUT = 10  # seconds for a fediverse server to say whose a token is
+JOURNAL_RE = re.compile(r"^[0-9a-f]{32}$")     # a journal's id, derived from its key
+SECRET_RE = re.compile(r"^[0-9a-f]{64}$")      # its secret, derived from the key too
+ESCROW_RE = re.compile(r"^[0-9a-f]{64}$")      # the key under a password: its id
+NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")  # an invite's name: whom it was for
+ESCROW_MAX = 4096
 
 
 class Refused(Exception):
     def __init__(self, status, text):
         super().__init__(text)
         self.status = status
-
-
-def host_of(instance):
-    """'https://Social.Example/' or 'social.example' → 'social.example' (None: not a
-    host we would ever call)."""
-    text = (instance or "").strip()
-    if "://" in text:
-        parts = urlsplit(text)
-        if parts.scheme != "https" or parts.path not in ("", "/") or parts.query:
-            return None
-        text = parts.netloc
-    text = text.lower().rstrip("/")
-    if not text or "@" in text or "/" in text or not re.fullmatch(r"[a-z0-9.:\[\]-]+", text):
-        return None
-    return text
-
-
-def is_public_ip(addr):
-    try:
-        return ipaddress.ip_address(addr.split("%", 1)[0]).is_global
-    except ValueError:
-        return False
-
-
-def public_host(host):
-    """Every address the name resolves to is a public one (no calls into the LAN)."""
-    name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
-    try:
-        infos = socket.getaddrinfo(name.strip("[]"), 443, type=socket.SOCK_STREAM)
-    except (OSError, UnicodeError):
-        return False
-    return bool(infos) and all(is_public_ip(i[4][0]) for i in infos)
-
-
-class NotPublic(OSError):
-    pass
-
-
-class _PublicOnlyHTTPS(http.client.HTTPSConnection):
-    """HTTPS that refuses, once connected, a peer that isn't a public address — the name
-    may resolve to another address than the one checked a moment before (DNS
-    rebinding)."""
-
-    def connect(self):
-        super().connect()
-        peer = self.sock.getpeername()[0]
-        if not is_public_ip(peer):
-            self.sock.close()
-            raise NotPublic(f"{self.host} is at {peer}, not a public address")
-
-
-class _PublicOnlyHandler(urllib.request.HTTPSHandler):
-    def https_open(self, req):
-        return self.do_open(_PublicOnlyHTTPS, req, context=self._context)
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A token check follows no redirect: a 3xx would carry the token elsewhere, and
-    with "*" anywhere, the LAN included."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None  # urllib raises HTTPError for the 3xx itself
-
-
-def opener(public_only):
-    ctx = ssl.create_default_context()
-    https = _PublicOnlyHandler(context=ctx) if public_only else \
-        urllib.request.HTTPSHandler(context=ctx)
-    return urllib.request.build_opener(_NoRedirect, https)
 
 
 class Window:
@@ -229,23 +179,34 @@ class Window:
             return w[1] <= self.limit
 
 
+def _hash(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _code_of(text):
+    """An invite code as people type it: case, spaces and dashes don't count."""
+    return re.sub(r"[\s-]", "", str(text or "")).upper()
+
+
 class Server:
-    def __init__(self, cfg, verify=None):
+    def __init__(self, cfg):
         self.cfg = {**DEFAULTS, **cfg}
-        self.allowed = {str(h).lower() for h in self.cfg["instances"]}
         self.db = sqlite3.connect(self.cfg["db"], check_same_thread=False,
                                   isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
         self.lock = threading.Lock()
-        self.verify = verify or self._verify_at_instance
-        self._tokens = {}   # sha256(host, token) -> (account or None, until)
-        self._tokens_lock = threading.Lock()
+        # journals of protocol 1 were filed under a fediverse account ("id@host"): nobody
+        # can reach them any more — the devices send their state anew under protocol 2
+        old = self.db.execute("DELETE FROM blobs WHERE account LIKE '%@%'").rowcount
+        old += self.db.execute("DELETE FROM media WHERE account LIKE '%@%'").rowcount
+        if old:
+            log.info("%d blobs and pictures of protocol 1 journals dropped", old)
         self.per_account = Window(self.cfg["requests_per_minute"])
         self.per_ip = Window(self.cfg["requests_per_minute_per_ip"])
-        self.verify_ip = Window(self.cfg["verifications_per_minute_per_ip"])
-        self.verify_all = Window(self.cfg["verifications_per_minute"])
-        # bytes kept: per account and in all (checked on every put without a scan)
+        self.new_journals = Window(self.cfg["new_journals_per_minute_per_ip"])
+        self.escrow_gets = Window(self.cfg["escrow_gets_per_minute_per_ip"])
+        # bytes kept: per journal and in all (checked on every put without a scan)
         self.used = dict(self.db.execute(
             "SELECT account, SUM(LENGTH(data)) FROM blobs GROUP BY account").fetchall())
         self.media_used = dict(self.db.execute(
@@ -254,75 +215,77 @@ class Server:
         self.media_puts = Window(self.cfg["media_per_minute"])
         self._media_clock = 0  # ms, never twice the same: the least used is exact
 
-    # ---- who is asking ---------------------------------------------------------------
-    def allowed_host(self, host):
-        if "*" in self.allowed:
-            return public_host(host)
-        return host in self.allowed
+    # ---- invites (the admin's, from the command line) ---------------------------------
+    def invite_add(self, name, code=None):
+        """A new code for `name`. → the code, shown once (only its hash is kept)."""
+        if not NAME_RE.match(name or ""):
+            raise ValueError("an invite's name: letters, digits, _ . @ -")
+        code = _code_of(code) if code else "-".join(
+            secrets.token_hex(2).upper() + secrets.token_hex(2).upper() for _ in range(3))
+        with self.lock:
+            if self.db.execute("SELECT 1 FROM invites WHERE name=?", (name,)).fetchone():
+                raise ValueError(f"{name}: there is an invite of that name")
+            self.db.execute("INSERT INTO invites VALUES (?, ?, ?)",
+                            (name, _hash(_code_of(code)), int(time.time())))
+        return code
 
-    def _verify_at_instance(self, host, token):
-        """→ the account's id on its server, or None (the server says no)."""
-        return self.fetch_account(f"https://{host}/api/v1/accounts/verify_credentials",
-                                  token, public_only="*" in self.allowed)
+    def invites(self):
+        """[(name, made, journals made with it)]."""
+        with self.lock:
+            return self.db.execute(
+                "SELECT i.name, i.made, (SELECT COUNT(*) FROM journals j WHERE j.invite = "
+                "i.name) FROM invites i ORDER BY i.name").fetchall()
 
-    @staticmethod
-    def fetch_account(url, token, public_only=False):
-        if urlsplit(url).scheme not in ("https", "http"):  # http:// only in the tests
-            raise Refused(HTTPStatus.BAD_GATEWAY, "not a web address")
-        req = urllib.request.Request(  # noqa: S310 — the scheme is checked just above
-            url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
-                          "User-Agent": f"fedtail-sync/{VERSION}"})
-        host = urlsplit(url).netloc
-        try:
-            with opener(public_only).open(req, timeout=VERIFY_TIMEOUT) as r:  # nosec B310
-                data = json.loads(r.read(64 * 1024))
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
+    def invite_revoke(self, name):
+        """The code taken back and the journals made with it gone. → how many journals,
+        or None — no such invite."""
+        with self.lock:
+            if not self.db.execute("SELECT 1 FROM invites WHERE name=?", (name,)).fetchone():
                 return None
-            raise Refused(HTTPStatus.BAD_GATEWAY, f"{host}: HTTP {e.code}") from e
-        except (OSError, ValueError, http.client.HTTPException) as e:
-            raise Refused(HTTPStatus.BAD_GATEWAY, f"{host}: {e.__class__.__name__}") from e
-        acc_id = data.get("id") if isinstance(data, dict) else None
-        if not isinstance(acc_id, (str, int)) or not str(acc_id) or len(str(acc_id)) > 64:
-            return None
-        return str(acc_id)
+            ids = [r[0] for r in self.db.execute("SELECT id FROM journals WHERE invite=?",
+                                                 (name,))]
+            self.db.execute("DELETE FROM invites WHERE name=?", (name,))
+        for jid in ids:
+            self.wipe(jid, journal_too=True)
+        return len(ids)
 
+    # ---- who is asking -----------------------------------------------------------------
     def let_in(self, ip):
         """The door: every request counts against its address."""
         if not self.per_ip.hit(ip):
             raise Refused(HTTPStatus.TOO_MANY_REQUESTS, "too many requests from you, slow down")
 
     def account(self, headers, ip="?"):
-        """The account behind a request's token, as 'id@host'. Refused otherwise."""
+        """The journal a request names, its secret checked; made now with an invite code
+        if it isn't here yet. Refused otherwise."""
         auth = headers.get("Authorization") or ""
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        host = host_of(headers.get("X-Fedtail-Instance"))
-        if not token or not host or len(token) > 512:
-            raise Refused(HTTPStatus.UNAUTHORIZED, "a token and X-Fedtail-Instance, please")
-        if not self.allowed_host(host):
-            raise Refused(HTTPStatus.FORBIDDEN, f"{host}: not served here")
-        h = hashlib.sha256(f"{host}\0{token}".encode()).hexdigest()
-        now = time.monotonic()
-        with self._tokens_lock:
-            known = self._tokens.get(h)
-        if known and known[1] > now:
-            acc = known[0]
-        else:
-            # a call to someone's server: capped per address and in all, so that
-            # random tokens can't turn this server into a hammer
-            if not self.verify_ip.hit(ip) or not self.verify_all.hit("*"):
-                raise Refused(HTTPStatus.TOO_MANY_REQUESTS, "too many token checks, later")
-            acc_id = self.verify(host, token)
-            acc = f"{acc_id}@{host}" if acc_id else None
-            with self._tokens_lock:
-                self._tokens[h] = (acc, now + (TOKEN_TTL if acc else REFUSED_TTL))
-                if len(self._tokens) > 10000:
-                    self._tokens = {k: v for k, v in self._tokens.items() if v[1] > now}
-        if not acc:
-            raise Refused(HTTPStatus.UNAUTHORIZED, "the token is refused by its server")
-        if not self.per_account.hit(acc):
+        secret = auth[7:].strip().lower() if auth.lower().startswith("bearer ") else ""
+        jid = (headers.get("X-Fedtail-Journal") or "").strip().lower()
+        if not JOURNAL_RE.match(jid) or not SECRET_RE.match(secret):
+            raise Refused(HTTPStatus.UNAUTHORIZED, "X-Fedtail-Journal and its secret, please")
+        with self.lock:
+            row = self.db.execute("SELECT secret FROM journals WHERE id=?", (jid,)).fetchone()
+        if row is None:
+            self._make(jid, secret, headers.get("X-Fedtail-Invite"), ip)
+        elif not secrets.compare_digest(row[0], _hash(secret)):
+            raise Refused(HTTPStatus.UNAUTHORIZED, "not this journal's secret")
+        if not self.per_account.hit(jid):
             raise Refused(HTTPStatus.TOO_MANY_REQUESTS, "too many requests, slow down")
-        return acc
+        return jid
+
+    def _make(self, jid, secret, code, ip):
+        if not code:
+            raise Refused(HTTPStatus.FORBIDDEN, "a new journal needs an invite code")
+        if not self.new_journals.hit(ip):
+            raise Refused(HTTPStatus.TOO_MANY_REQUESTS, "too many new journals, later")
+        with self.lock:
+            row = self.db.execute("SELECT name FROM invites WHERE code=?",
+                                  (_hash(_code_of(code)),)).fetchone()
+            if row is None:
+                raise Refused(HTTPStatus.FORBIDDEN, "no such invite code (or taken back)")
+            self.db.execute("INSERT OR IGNORE INTO journals VALUES (?, ?, ?, ?)",
+                            (jid, _hash(secret), row[0], int(time.time())))
+        log.info("a journal made with the invite %s", row[0])
 
     # ---- the journal -----------------------------------------------------------------
     def put(self, acc, device, blob):
@@ -376,13 +339,43 @@ class Server:
             self.total -= freed
             return n
 
-    def wipe(self, acc):
-        """The account's journal gone, and its pictures with it."""
+    def wipe(self, acc, journal_too=False):
+        """The journal's blobs gone, its pictures and its key under a password with them;
+        journal_too — the journal itself (its invite taken back)."""
         with self.lock:
             n = self.db.execute("DELETE FROM blobs WHERE account=?", (acc,)).rowcount
             self.db.execute("DELETE FROM media WHERE account=?", (acc,))
+            self.db.execute("DELETE FROM escrow WHERE journal=?", (acc,))
+            if journal_too:
+                self.db.execute("DELETE FROM journals WHERE id=?", (acc,))
             self.total -= self.used.pop(acc, 0) + self.media_used.pop(acc, 0)
             return n
+
+    # ---- the key under a password ------------------------------------------------------
+    def escrow_put(self, acc, eid, data):
+        """The journal's key sealed by a password, under an id the client derived from
+        the password: one per journal, a new one replaces it."""
+        if not ESCROW_RE.match(eid):
+            raise Refused(HTTPStatus.BAD_REQUEST, "an escrow id: 64 hex digits")
+        if not data or len(data) > ESCROW_MAX:
+            raise Refused(HTTPStatus.BAD_REQUEST, "a key under a password: 1…4096 bytes")
+        with self.lock:
+            self.db.execute("DELETE FROM escrow WHERE journal=? OR id=?", (acc, eid))
+            self.db.execute("INSERT INTO escrow VALUES (?, ?, ?)", (eid, acc, data))
+        return True
+
+    def escrow_get(self, eid, ip="?"):
+        """Its bytes, asked without a journal (a new device has only the password): the
+        id is all there is, so asking is slow per address."""
+        if not ESCROW_RE.match(eid):
+            raise Refused(HTTPStatus.BAD_REQUEST, "an escrow id: 64 hex digits")
+        if not self.escrow_gets.hit(ip):
+            raise Refused(HTTPStatus.TOO_MANY_REQUESTS, "too many tries, later")
+        with self.lock:
+            row = self.db.execute("SELECT data FROM escrow WHERE id=?", (eid,)).fetchone()
+        if row is None:
+            raise Refused(HTTPStatus.NOT_FOUND, "no such key here")
+        return row[0]
 
     # ---- the pictures of drafts --------------------------------------------------------
     def media_on(self):
@@ -573,23 +566,30 @@ class Handler(BaseHTTPRequestHandler):
         try:
             q = {k: v[-1] for k, v in parse_qs(url.query, max_num_fields=10).items()}
             self.app.let_in(self.client_ip)
-            if method == "GET" and url.path in ("/v1", "/v1/"):
-                hello = {"fedtail-sync": VERSION, "compact": 1}
+            path = url.path
+            if method == "GET" and path in ("/v1", "/v1/", "/v2", "/v2/"):
+                # a client of protocol 1 asking /v1 learns there's another one here
+                hello = {"fedtail-sync": VERSION, "compact": 1, "escrow": 1}
                 if self.app.media_on():
                     hello["media_kb"] = self.app.cfg["max_media_kb"]
                 return self._send(200, hello)
-            if url.path.startswith("/v1/media/"):
-                return self._media(method, url.path[len("/v1/media/"):])
-            if url.path.startswith("/v1/devices/"):
+            if not path.startswith("/v2/"):
+                return self._send(404, {"error": "no such thing (protocol 2: /v2)"})
+            path = path[len("/v2"):]
+            if path.startswith("/escrow/"):
+                return self._escrow(method, path[len("/escrow/"):])
+            if path.startswith("/media/"):
+                return self._media(method, path[len("/media/"):])
+            if path.startswith("/devices/"):
                 if method != "DELETE":
                     return self._send(501, {"error": "not this method"})
-                device = url.path[len("/v1/devices/"):]
-                if not device or not DEVICE_RE.match(device):  # before the token
+                device = path[len("/devices/"):]
+                if not device or not DEVICE_RE.match(device):  # before the journal
                     raise Refused(HTTPStatus.BAD_REQUEST, "a device id")
                 acc = self.app.account(self.headers, self.client_ip)
                 return self._send(200, {"deleted": self.app.compact(
                     acc, device, _number(q, "before", 0))})
-            if url.path != "/v1/blobs":
+            if path != "/blobs":
                 return self._send(404, {"error": "no such thing"})
             if method == "PUT":
                 return self._send(501, {"error": "not this method"})
@@ -617,10 +617,20 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("%s %s failed", method, url.path)
             return self._send(500, {"error": "internal error"})
 
-    def _media(self, method, name):
-        """PUT / GET / DELETE /v1/media/<name>: one sealed picture of a draft."""
+    def _escrow(self, method, eid):
+        """PUT (a device of the journal) / GET (anyone with the id) /v2/escrow/<id>."""
         app = self.app
-        app._media_name(name)  # before the token: no checks spent on nonsense
+        if method == "GET":
+            return self._bytes(app.escrow_get(eid, self.client_ip))
+        if method != "PUT":
+            return self._send(501, {"error": "not this method"})
+        acc = app.account(self.headers, self.client_ip)
+        return self._send(200, {"stored": app.escrow_put(acc, eid, self._body(4))})
+
+    def _media(self, method, name):
+        """PUT / GET / DELETE /v2/media/<name>: one sealed picture of a draft."""
+        app = self.app
+        app._media_name(name)  # before the journal: no work spent on nonsense
         acc = app.account(self.headers, self.client_ip)
         if method == "PUT":
             return self._send(200, {"stored": app.media_put(
@@ -701,8 +711,8 @@ def make_http_server(app):
 def load_config(path):
     with open(path, "rb") as f:
         data = tomllib.load(f)
-    for gone in RETIRED & set(data):  # an older config: said, not fatal
-        log.warning("option %s is gone (%s) — ignored", gone, RETIRED_WHY)
+    for gone in set(RETIRED) & set(data):  # an older config: said, not fatal
+        log.warning("option %s is gone (%s) — ignored", gone, RETIRED[gone])
         del data[gone]
     unknown = set(data) - set(DEFAULTS)
     if unknown:
@@ -710,13 +720,46 @@ def load_config(path):
     return data
 
 
-def main(argv=None):
+def invite_command(app, words, out):
+    """`invite add <name> [code]` / `invite list` / `invite revoke <name>`. → exit code."""
+    what, rest = (words[0] if words else ""), words[1:]
+    if what == "add" and rest:
+        try:
+            code = app.invite_add(rest[0], rest[1] if len(rest) > 1 else None)
+        except ValueError as e:
+            print(f"fedtail-sync: {e}", file=out)
+            return 1
+        print(f"invite {rest[0]}: {code}", file=out)
+        print("(shown this once: only its hash is kept; give it to the person — their "
+              "first device puts it in ≡ → Sync)", file=out)
+        return 0
+    if what == "list" and not rest:
+        rows = app.invites()
+        for name, made, n in rows:
+            when = time.strftime("%Y-%m-%d", time.gmtime(made))
+            print(f"{name}\tmade {when}\tjournals {n}", file=out)
+        if not rows:
+            print("no invites yet: invite add <name>", file=out)
+        return 0
+    if what == "revoke" and len(rest) == 1:
+        n = app.invite_revoke(rest[0])
+        if n is None:
+            print(f"fedtail-sync: no invite {rest[0]}", file=out)
+            return 1
+        print(f"invite {rest[0]} taken back, {n} journal(s) made with it gone", file=out)
+        return 0
+    print("invite add <name> [code] | invite list | invite revoke <name>", file=out)
+    return 2
+
+
+def main(argv=None, out=None):
+    import sys
     p = argparse.ArgumentParser(prog="fedtail-sync", description=__doc__.split("\n")[0])
+    p.add_argument("command", nargs="*", help="none — serve; invite add <name> [code] | "
+                   "invite list | invite revoke <name>")
     p.add_argument("--config", help="a TOML file with the options (see README.md)")
     p.add_argument("--listen", help=f"address:port (default {DEFAULTS['listen']})")
     p.add_argument("--db", help="the SQLite file")
-    p.add_argument("--instance", action="append", help="a server whose people are served "
-                   "(again for more; * — anyone)")
     p.add_argument("--version", action="version",
                    version=f"fedtail-sync {__version__} (protocol {VERSION})")
     a = p.parse_args(argv)
@@ -725,15 +768,18 @@ def main(argv=None):
     for k in ("listen", "db"):
         if getattr(a, k):
             cfg[k] = getattr(a, k)
-    if a.instance:
-        cfg["instances"] = a.instance
     app = Server(cfg)
-    if not app.allowed:
-        log.warning("no instances allowed: every request will be refused (set instances)")
+    if a.command:
+        if a.command[0] != "invite":
+            p.error(f"unknown command {a.command[0]!r}")
+        try:
+            return invite_command(app, a.command[1:], out or sys.stdout)
+        finally:
+            app.db.close()
+    if not app.invites():
+        log.warning("no invite codes yet: nobody can make a journal (invite add <name>)")
     httpd = make_http_server(app)
-    log.info("fedtail-sync %s (protocol %d) on %s, serving %s", __version__, VERSION,
-             app.cfg["listen"],
-             ", ".join(sorted(app.allowed)) or "nobody")
+    log.info("fedtail-sync %s (protocol %d) on %s", __version__, VERSION, app.cfg["listen"])
 
     stop = threading.Event()
 
@@ -752,7 +798,8 @@ def main(argv=None):
         stop.set()
         keeper.join(5)
         httpd.server_close()
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover — run as a program, not imported
-    main()
+    raise SystemExit(main())

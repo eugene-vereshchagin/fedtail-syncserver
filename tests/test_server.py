@@ -1,18 +1,18 @@
-"""fedtail-sync doing its job: whose journal is whose, the limits an honest client meets,
-the token check, old journals going, the config and the program itself."""
+"""fedtail-sync doing its job: whose journal is whose (its key's, made with an invite),
+the limits an honest client meets, the key under a password, invites given and taken
+back, old journals going, the config and the program itself."""
 
 import http.client
 import io
 import json
 import logging
 import socket
-import threading
 import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from .live import Live, Tmp
+from .live import ME, YOU, Live, Tmp, creds
 
 
 class JournalTest(Live):
@@ -21,10 +21,16 @@ class JournalTest(Live):
         self.start(quota_mb=1, max_blob_kb=64)
 
     def test_whose_journal_is_whose(self):
-        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1, "compact": 1,
-                                                    "media_kb": 4096}))
-        self.assertEqual(self.call("GET", "/v1/")[1]["fedtail-sync"], 1)
+        hello = {"fedtail-sync": 2, "compact": 1, "escrow": 1, "media_kb": 4096}
+        self.assertEqual(self.call("GET", "/v2"), (200, hello))
+        self.assertEqual(self.call("GET", "/v1"), (200, hello))  # protocol 1 learns of 2
+        self.assertEqual(self.call("GET", "/v1/")[1]["fedtail-sync"], 2)
         self.assertEqual(self.call("GET", "/.well-known/fedtail-sync")[0], 404)  # gone
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/v1/blobs")  # protocol 1's paths: gone
+        self.assertEqual(c.getresponse().status, 404)
+        c.close()
+        self.assertEqual(self.call("GET", "/v2/nothing", "t-me")[0], 404)
         self.assertEqual(self.call("POST", "/v1/blobs", "t-me", b"one",
                                    {"X-Fedtail-Device": "d1"}), (200, {"seq": 1}))
         self.assertEqual(self.call("POST", "/v1/blobs", "t-me2", b"two",
@@ -51,13 +57,19 @@ class JournalTest(Live):
 
     def test_strangers_refused(self):
         self.assertEqual(self.call("GET", "/v1/blobs")[0], 401)
-        self.assertEqual(self.call("GET", "/v1/blobs", "nope")[0], 401)
-        self.assertEqual(self.call("GET", "/v1/blobs", "t-me",
-                                   instance="https://else.example")[0], 403)
-        self.assertEqual(self.call("GET", "/v1/blobs", "t-me",
-                                   instance="http://me.example")[0], 401)  # not https
-        self.assertEqual(self.call("GET", "/v1/blobs", headers={
-            "Authorization": "Basic dDp0", "X-Fedtail-Instance": "me.example"})[0], 401)
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-me")[0], 200)  # made, with CODE
+        self.assertEqual(self.call("GET", "/v1/blobs", "nope")[0], 401)  # its secret, wrong
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-me", invite=None)[0], 200)  # there
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-you", invite=None)[0], 403)
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-you", invite="NOPE")[0], 403)
+        jid, secret = creds("t-me")
+        for h in ({"Authorization": "Basic dDp0", "X-Fedtail-Journal": jid},
+                  {"Authorization": f"Bearer {secret}", "X-Fedtail-Journal": "../x"},
+                  {"Authorization": "Bearer short", "X-Fedtail-Journal": jid}):
+            self.assertEqual(self.call("GET", "/v1/blobs", headers=h)[0], 401)
+        # an invite code as people type it: case, spaces and dashes don't count
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-you",
+                                   invite=" test code 0001 ".lower())[0], 200)
 
     def test_the_quota_and_the_size(self):
         self.assertEqual(self.call("POST", "/v1/blobs", "t-me", b"x" * 70 * 1024)[0], 413)
@@ -68,19 +80,21 @@ class JournalTest(Live):
 
     def test_put_checks_on_its_own_too(self):
         with self.assertRaises(self.mod.Refused) as e:
-            self.app.put("1@me.example", "d", b"")
+            self.app.put(ME, "d", b"")
         self.assertEqual(e.exception.status, 400)
         with self.assertRaises(self.mod.Refused) as e:
-            self.app.put("1@me.example", "d", b"x" * 65 * 1024)
+            self.app.put(ME, "d", b"x" * 65 * 1024)
         self.assertEqual(e.exception.status, 413)
 
     def test_an_empty_body_is_refused(self):
         self.assertEqual(self.call("POST", "/v1/blobs", "t-me", b"")[0], 400)
 
     def test_a_body_cut_short_by_the_client(self):
-        out = self.raw(b"POST /v1/blobs HTTP/1.1\r\nAuthorization: Bearer t-me\r\n"
-                       b"X-Fedtail-Instance: me.example\r\nContent-Length: 100\r\n\r\nabc",
-                       half_close=True)
+        jid, secret = creds("t-me")
+        self.call("GET", "/v1/blobs", "t-me")  # the journal made
+        out = self.raw(f"POST /v2/blobs HTTP/1.1\r\nAuthorization: Bearer {secret}\r\n"
+                       f"X-Fedtail-Journal: {jid}\r\nContent-Length: 100\r\n\r\n"
+                       f"abc".encode(), half_close=True)
         self.assertIn(b" 400 ", out)
         self.assertIn(b"shorter than promised", out)
 
@@ -93,15 +107,15 @@ class JournalTest(Live):
         for dev, body in (("d1", b"old1"), ("d2", b"theirs"), ("d1", b"old2"),
                           ("d1", b"snapshot")):
             self.call("POST", "/v1/blobs", "t-me", body, {"X-Fedtail-Device": dev})
-        used = self.app.used["1@me.example"]
+        used = self.app.used[ME]
         self.assertEqual(self.call("DELETE", "/v1/devices/d1?before=4", "t-me"),
                          (200, {"deleted": 2}))
         got = self.call("GET", "/v1/blobs?after=0", "t-me")[1]
         self.assertEqual([(b["seq"], b["device"]) for b in got["blobs"]],
                          [(2, "d2"), (4, "d1")])
-        self.assertEqual(self.app.used["1@me.example"], used - 8)
+        self.assertEqual(self.app.used[ME], used - 8)
         self.assertEqual(self.call("DELETE", "/v1/devices/d1?before=4", "t-you"),
-                         (200, {"deleted": 0}))  # whose: another account's d1 is not mine
+                         (200, {"deleted": 0}))  # whose: another journal's d1 is not mine
         self.assertEqual(self.call("DELETE", "/v1/devices/d1", "t-me"),
                          (200, {"deleted": 0}))  # no before: nothing
         self.assertEqual(self.call("DELETE", "/v1/devices/bad!?before=4", "t-me")[0], 400)
@@ -110,7 +124,7 @@ class JournalTest(Live):
         self.assertEqual(self.call("GET", "/v1/devices/d1", "t-me")[0], 501)
         self.assertEqual(self.call("DELETE", "/v1/devices/d1?before=4")[0], 401)
         with self.assertRaises(self.mod.Refused) as e:  # checked when called directly too
-            self.app.compact("1@me.example", "", 4)
+            self.app.compact(ME, "", 4)
         self.assertEqual(e.exception.status, 400)
 
 
@@ -139,18 +153,18 @@ class MediaTest(Live):
         self.assertEqual(self.call("DELETE", f"/v1/media/{N1}", "t-me"),
                          (200, {"deleted": 0}))
         self.assertEqual(self.call("GET", f"/v1/media/{N1}", "t-me")[0], 404)
-        self.assertEqual(self.app.media_used["1@me.example"], 0)
+        self.assertEqual(self.app.media_used[ME], 0)
 
     def test_names_sizes_methods_and_tokens(self):
         self.assertEqual(self.call("PUT", "/v1/media/NOTHEX", "t-me", b"x")[0], 400)
-        self.assertEqual(len(self.calls), 0)  # nonsense costs no token check
+        self.assertNotIn(ME, self.app.used)  # nonsense made no journal
         self.assertEqual(self.call("PUT", f"/v1/media/{N1}", None, b"x")[0], 401)
         self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"")[0], 400)
         self.assertEqual(self.call("PUT", f"/v1/media/{N2}", "t-me", b"x" * 101 * 1024)[0],
                          413)
         self.assertEqual(self.call("POST", f"/v1/media/{N1}", "t-me", b"x")[0], 501)
         with self.assertRaises(self.mod.Refused) as e:  # the size, when called directly
-            self.app.media_put("1@me.example", N3, b"x" * 101 * 1024)
+            self.app.media_put(ME, N3, b"x" * 101 * 1024)
         self.assertEqual(e.exception.status, 413)
 
     def test_a_loop_of_drafts_churns_only_its_own(self):
@@ -162,7 +176,7 @@ class MediaTest(Live):
                                        b"p" * 100 * 1024)[0], 200)
             if i == 9:  # the first one used again: the second is now the least used
                 self.call("GET", f"/v1/media/{0:032x}", "t-me")
-        self.assertLessEqual(self.app.media_used["1@me.example"], 1024 * 1024)
+        self.assertLessEqual(self.app.media_used[ME], 1024 * 1024)
         self.assertEqual(self.call("GET", f"/v1/media/{0:032x}", "t-me")[0], 200)
         self.assertEqual(self.call("GET", f"/v1/media/{1:032x}", "t-me")[0], 404)  # gone
         self.assertEqual(self.call("POST", "/v1/blobs", "t-me", b"journal")[0], 200)
@@ -200,17 +214,17 @@ class MediaTest(Live):
 
     def test_counted_again_at_start(self):
         self.call("PUT", f"/v1/media/{N1}", "t-me", b"pic")
-        again = self.mod.Server({"db": str(self.tmp / "s.db"), "instances": ["me.example"]},
-                                verify=lambda h, t: None)
+        again = self.mod.Server({"db": str(self.tmp / "s.db")})
         self.addCleanup(again.db.close)
-        self.assertEqual(again.media_used, {"1@me.example": 3})
+        self.assertEqual(again.media_used, {ME: 3})
         self.assertEqual(again.total, 3)
 
 
 class NoMediaTest(Live):
     def test_off(self):
         self.start(media_quota_mb=0)
-        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1, "compact": 1}))
+        self.assertEqual(self.call("GET", "/v2"), (200, {"fedtail-sync": 2, "compact": 1,
+                                                    "escrow": 1}))
         self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"x")[0], 404)
 
 
@@ -220,7 +234,8 @@ class AccountLimitTest(Live):
         codes = [self.call("GET", "/v1/blobs", "t-me",
                            headers={"X-Real-IP": f"198.51.100.{i}"})[0] for i in range(5)]
         self.assertEqual(codes, [200, 200, 200, 429, 429])
-        self.assertEqual(self.call("GET", "/v1/blobs", "t-you")[0], 200)  # others aren't
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-you",
+                                   headers={"X-Real-IP": "198.51.100.9"})[0], 200)  # others
 
     def test_a_zero_limit_is_no_limit(self):
         w = self.mod.Window(0)
@@ -235,128 +250,79 @@ class AccountLimitTest(Live):
             self.assertTrue(w.hit("k"))
 
 
-class TokenCacheTest(Live):
-    def test_known_and_refused_tokens_are_remembered(self):
+class InviteTest(Live):
+    """Invite codes: one per person, shown once, any number of them; taken back, the
+    journals made with it go — the others stay."""
+
+    def test_given_listed_and_taken_back(self):
         self.start()
-        for _ in range(3):
-            self.call("GET", "/v1/blobs", "t-me")
-            self.call("GET", "/v1/blobs", "bad")
-        self.assertEqual(sorted(self.calls), ["bad", "t-me"])
-        # a token is believed for TOKEN_TTL; after it, asked again
-        later = time.monotonic() + self.mod.TOKEN_TTL + 1
-        with mock.patch.object(self.mod.time, "monotonic", return_value=later):
-            self.call("GET", "/v1/blobs", "t-me")
-        self.assertEqual(self.calls.count("t-me"), 2)
+        anna = self.app.invite_add("anna")
+        self.assertRegex(anna, r"^[0-9A-F]{8}-[0-9A-F]{8}-[0-9A-F]{8}$")
+        with self.assertRaises(ValueError):
+            self.app.invite_add("anna")  # one of a name
+        with self.assertRaises(ValueError):
+            self.app.invite_add("no spaces please")
+        self.assertNotIn(anna, str(self.app.db.execute("SELECT * FROM invites").fetchall()))
+        self.call("POST", "/v1/blobs", "t-me", b"mine")              # with CODE ("tests")
+        self.call("POST", "/v1/blobs", "t-you", b"hers", invite=anna)
+        self.call("PUT", "/v1/escrow/" + "e" * 64, "t-you", b"her key")
+        self.assertEqual([(n, j) for n, _m, j in self.app.invites()],
+                         [("anna", 1), ("tests", 1)])
+        self.assertEqual(self.app.invite_revoke("anna"), 1)
+        self.assertIsNone(self.app.invite_revoke("anna"))
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-you", invite=None)[0], 403)
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-you", invite=anna)[0], 403)
+        self.assertEqual(self.call("GET", "/v2/escrow/" + "e" * 64)[0], 404)
+        self.assertNotIn(YOU, self.app.used)
+        self.assertEqual(len(self.call("GET", "/v1/blobs", "t-me")[1]["blobs"]), 1)
 
-    def test_the_cache_is_pruned(self):
+    def test_new_journals_have_a_pace(self):
+        self.start(new_journals_per_minute_per_ip=1)
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-me")[0], 200)
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-you")[0], 429)
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-me")[0], 200)  # made: no pace
+
+    def test_protocol_1_journals_go_at_start(self):
         self.start()
-        gone = time.monotonic() - 1
-        self.app._tokens = {f"h{i}": (None, gone) for i in range(10_001)}
-        self.call("GET", "/v1/blobs", "t-me")
-        self.assertEqual(len(self.app._tokens), 1)
-
-    def test_the_real_check_is_asked_of_the_named_server(self):
-        app = self.mod.Server({"db": ":memory:", "instances": ["me.example"]})
-        self.addCleanup(app.db.close)
-        with mock.patch.object(self.mod.Server, "fetch_account", return_value="7") as f:
-            self.assertEqual(app._verify_at_instance("me.example", "tok"), "7")
-        f.assert_called_once_with("https://me.example/api/v1/accounts/verify_credentials",
-                                  "tok", public_only=False)
-        star = self.mod.Server({"db": ":memory:", "instances": ["*"]})
-        self.addCleanup(star.db.close)
-        with mock.patch.object(self.mod.Server, "fetch_account", return_value="7") as f:
-            star._verify_at_instance("x.example", "tok")
-        self.assertTrue(f.call_args.kwargs["public_only"])  # "*": public addresses only
+        self.app.put("1@me.example", "d", b"old")
+        self.app.db.execute("INSERT INTO media VALUES ('1@me.example', ?, 0, ?)",
+                            ("a" * 32, b"pic"))
+        with self.assertLogs("fedtail-sync", "INFO") as logs:
+            again = self.mod.Server({"db": str(self.tmp / "s.db")})
+        self.addCleanup(again.db.close)
+        self.assertIn("2 blobs and pictures of protocol 1", logs.output[0])
+        self.assertEqual(again.total, 0)
 
 
-class FetchAccountTest(Tmp):
-    """Server.fetch_account against small servers on localhost."""
+class EscrowTest(Live):
+    """The key under a password: put by a device of the journal, taken by anyone with
+    the id derived from the password — slowly, per address."""
 
-    def serve(self, status, body=b"", raw=None):
-        """One answer, then gone. → the URL to ask."""
-        srv = socket.create_server(("127.0.0.1", 0))
-        self.addCleanup(srv.close)
-
-        def answer():
-            conn, _ = srv.accept()
-            conn.recv(65536)
-            if raw is not None:
-                conn.sendall(raw)
-            else:
-                conn.sendall(f"HTTP/1.1 {status} X\r\nContent-Length: {len(body)}\r\n"
-                             f"Connection: close\r\n\r\n".encode() + body)
-            conn.close()
-        threading.Thread(target=answer, daemon=True).start()
-        return f"http://127.0.0.1:{srv.getsockname()[1]}/api/v1/accounts/verify_credentials"
-
-    def test_who(self):
-        self.assertEqual(self.mod.Server.fetch_account(self.serve(200, b'{"id": 5}'), "t"), "5")
-        self.assertIsNone(self.mod.Server.fetch_account(self.serve(200, b'["x"]'), "t"))
-        self.assertIsNone(self.mod.Server.fetch_account(self.serve(200, b'{"id": ""}'), "t"))
-
-    def test_refused_tokens_and_broken_servers(self):
-        self.assertIsNone(self.mod.Server.fetch_account(self.serve(401), "t"))
-        self.assertIsNone(self.mod.Server.fetch_account(self.serve(403), "t"))
-        for url in (self.serve(500), self.serve(200, b"not json"),
-                    self.serve(0, raw=b"garbage\r\n\r\n")):
+    def test_put_and_taken(self):
+        self.start(escrow_gets_per_minute_per_ip=2)
+        eid = "e" * 64
+        self.assertEqual(self.call("PUT", f"/v2/escrow/{eid}", "t-me", b"sealed"),
+                         (200, {"stored": True}))
+        self.assertEqual(self.call("GET", f"/v2/escrow/{eid}"), (200, b"sealed"))
+        self.call("PUT", "/v2/escrow/" + "f" * 64, "t-me", b"anew")  # one per journal
+        self.assertEqual(self.call("GET", f"/v2/escrow/{eid}")[0], 404)
+        self.assertEqual(self.call("GET", "/v2/escrow/" + "f" * 64)[0], 429)  # the 3rd
+        self.assertEqual(self.call("GET", "/v2/escrow/nothex")[0], 400)
+        self.assertEqual(self.call("PUT", "/v2/escrow/" + "f" * 64, None, b"x")[0], 401)
+        self.assertEqual(self.call("DELETE", f"/v2/escrow/{eid}", "t-me")[0], 501)
+        self.assertEqual(self.call("PUT", f"/v2/escrow/{eid}", "t-me", b"x" * 5000)[0], 413)
+        for bad in ((ME, "nothex", b"x"), (ME, eid, b"")):
             with self.assertRaises(self.mod.Refused) as e:
-                self.mod.Server.fetch_account(url, "t")
-            self.assertEqual(e.exception.status, 502)
-
-    def test_nobody_there(self):
-        s = socket.create_server(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()
+                self.app.escrow_put(*bad)
+            self.assertEqual(e.exception.status, 400)
         with self.assertRaises(self.mod.Refused):
-            self.mod.Server.fetch_account(f"http://127.0.0.1:{port}/x", "t")
-
-    def test_only_web_addresses(self):
-        for url in ("file:///etc/passwd", "ftp://x.example/", "data:,{}"):
-            with self.assertRaises(self.mod.Refused):
-                self.mod.Server.fetch_account(url, "t")
-
-    def test_https_public_only_goes_through_its_own_connection(self):
-        """The public-only opener is the one used for https:// with "*" (a TLS handshake
-        with something that isn't TLS fails: what matters is that it gets that far)."""
-        srv = socket.create_server(("127.0.0.1", 0))
-        self.addCleanup(srv.close)
-        threading.Thread(target=lambda: srv.accept()[0].close(), daemon=True).start()
-        made = []
-        real = self.mod._PublicOnlyHTTPS
-
-        class Spy(real):
-            def __init__(self, *a, **k):
-                made.append(a)
-                super().__init__(*a, **k)
-        with mock.patch.object(self.mod, "_PublicOnlyHTTPS", Spy):
-            with self.assertRaises(self.mod.Refused):
-                self.mod.Server.fetch_account(
-                    f"https://127.0.0.1:{srv.getsockname()[1]}/x", "t", public_only=True)
-        self.assertTrue(made)
+            self.app.escrow_get("nothex")
+        self.call("DELETE", "/v1/blobs", "t-me")  # the journal wiped: its key under a
+        self.assertEqual(self.app.db.execute(  # password with it
+            "SELECT COUNT(*) FROM escrow").fetchone()[0], 0)
 
 
 class NamesTest(Tmp):
-    def test_hosts(self):
-        h = self.mod.host_of
-        self.assertEqual(h("https://X.Example/"), "x.example")
-        self.assertEqual(h("social.example:8443"), "social.example:8443")
-        self.assertIsNone(h(None))
-        self.assertIsNone(h("https://x.example/path"))
-
-    def test_public_addresses(self):
-        self.assertFalse(self.mod.is_public_ip("not an address"))
-        self.assertTrue(self.mod.is_public_ip("2606:4700:4700::1111"))
-        with mock.patch.object(self.mod.socket, "getaddrinfo", side_effect=OSError("no dns")):
-            self.assertFalse(self.mod.public_host("x.example"))
-        with mock.patch.object(self.mod.socket, "getaddrinfo", return_value=[]):
-            self.assertFalse(self.mod.public_host("x.example"))
-        info = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
-                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 443))]
-        with mock.patch.object(self.mod.socket, "getaddrinfo", return_value=info):
-            self.assertFalse(self.mod.public_host("half.example:443"))  # one is LAN
-        with mock.patch.object(self.mod.socket, "getaddrinfo", return_value=info[:1]):
-            self.assertTrue(self.mod.public_host("x.example"))
-
     def test_the_real_address(self):
         r = self.mod.real_ip
         self.assertEqual(r("127.0.0.1", "203.0.113.9"), "203.0.113.9")
@@ -369,20 +335,20 @@ class NamesTest(Tmp):
 
 class ExpireTest(Tmp):
     def test_old_journals_go_and_the_count_follows(self):
-        app = self.mod.Server({"db": str(self.tmp / "s.db"), "instances": [], "keep_days": 7})
+        app = self.mod.Server({"db": str(self.tmp / "s.db"), "keep_days": 7})
         self.addCleanup(app.db.close)
-        app.put("1@x", "a", b"old" * 100)
-        app.put("1@x", "a", b"new")
-        app.put("2@x", "b", b"old too")
+        app.put(ME, "a", b"old" * 100)
+        app.put(ME, "a", b"new")
+        app.put(YOU, "b", b"old too")
         app.db.execute("UPDATE blobs SET at = ? WHERE data != ?",
                        (int(time.time()) - 8 * 86400, b"new"))
         with self.assertLogs("fedtail-sync", "INFO") as logs:
             app.expire()
         self.assertIn("expired 2", logs.output[0])
         self.assertEqual(app.db.execute("SELECT data FROM blobs").fetchall(), [(b"new",)])
-        self.assertEqual((app.used, app.total), ({"1@x": 3}, 3))
+        self.assertEqual((app.used, app.total), ({ME: 3}, 3))
         app.expire()  # nothing old: nothing said
-        keep = self.mod.Server({"db": str(self.tmp / "s.db"), "instances": []})
+        keep = self.mod.Server({"db": str(self.tmp / "s.db")})
         self.addCleanup(keep.db.close)
         keep.expire()  # keep_days = 0: kept for ever
         self.assertEqual(keep.total, 3)
@@ -421,13 +387,13 @@ class PlumbingTest(Live):
         self.assertIn("198.51.100.4: connection error", logs.output[0])
 
     def test_listening_beyond_this_machine_is_warned_about(self):
-        app = self.mod.Server({"db": ":memory:", "instances": [], "listen": "0.0.0.0:0"})
+        app = self.mod.Server({"db": ":memory:", "listen": "0.0.0.0:0"})
         self.addCleanup(app.db.close)
         with self.assertLogs("fedtail-sync", "WARNING") as logs:
             srv = self.mod.make_http_server(app)
         srv.server_close()
         self.assertIn("plain HTTP", logs.output[0])
-        named = self.mod.Server({"db": ":memory:", "instances": [], "listen": "localhost:0"})
+        named = self.mod.Server({"db": ":memory:", "listen": "localhost:0"})
         self.addCleanup(named.db.close)
         self.mod.make_http_server(named).server_close()  # a name: nothing to judge
 
@@ -438,17 +404,19 @@ class PlumbingTest(Live):
         except OSError:
             self.skipTest("::1 can't be bound here")
         c = http.client.HTTPConnection("::1", self.port, timeout=5)
-        c.request("GET", "/v1")
-        self.assertEqual(json.loads(c.getresponse().read()), {"fedtail-sync": 1})
+        c.request("GET", "/v2")
+        self.assertEqual(json.loads(c.getresponse().read())["fedtail-sync"], 2)
         c.close()
 
 
 class ConfigTest(Tmp):
     def test_an_older_config_still_starts(self):
         cfg = self.tmp / "s.toml"
-        cfg.write_text('instances = ["me.example"]\npublic_url = "https://x.example"\n')
-        with self.assertLogs("fedtail-sync", "WARNING"):
-            self.assertEqual(self.mod.load_config(cfg), {"instances": ["me.example"]})
+        cfg.write_text('instances = ["me.example"]\npublic_url = "https://x.example"\n'
+                       'verifications_per_minute = 5\nquota_mb = 3\n')
+        with self.assertLogs("fedtail-sync", "WARNING") as logs:
+            self.assertEqual(self.mod.load_config(cfg), {"quota_mb": 3})
+        self.assertEqual(len(logs.output), 3)
         cfg.write_text('instancez = ["me.example"]\n')
         with self.assertRaises(SystemExit):
             self.mod.load_config(cfg)
@@ -475,29 +443,52 @@ class MainTest(Tmp):
 
     def test_from_a_config_file(self):
         cfg = self.tmp / "c.toml"
-        cfg.write_text(f'listen = "127.0.0.1:0"\ndb = "{self.tmp / "a.db"}"\n'
-                       'instances = ["me.example"]\nkeep_days = 3\n')
+        cfg.write_text(f'listen = "127.0.0.1:0"\ndb = "{self.tmp / "a.db"}"\nkeep_days = 3\n')
         with self.assertLogs("fedtail-sync", "INFO") as logs, \
                 mock.patch.object(self.mod.Server, "expire") as expire:
             app, srv = self.run_main("--config", str(cfg))
-        self.assertEqual((app.allowed, app.cfg["keep_days"]), ({"me.example"}, 3))
+        self.assertEqual(app.cfg["keep_days"], 3)
         expire.assert_called()  # the clean-up ran (and stopped with the server)
-        self.assertTrue(any("serving me.example" in line for line in logs.output))
+        self.assertTrue(any("no invite codes yet" in line for line in logs.output))
         self.assertEqual(srv.socket.fileno(), -1)  # closed on the way out
 
-    def test_from_the_command_line_and_nobody_served(self):
-        with self.assertLogs("fedtail-sync", "WARNING") as logs:
-            app, _ = self.run_main("--listen", "127.0.0.1:0", "--db", str(self.tmp / "b.db"))
-        self.assertIn("no instances allowed", logs.output[0])
-        app, _ = self.run_main("--listen", "127.0.0.1:0", "--db", str(self.tmp / "c.db"),
-                               "--instance", "a.example", "--instance", "b.example")
-        self.assertEqual(app.allowed, {"a.example", "b.example"})
+    def test_invites_from_the_command_line(self):
+        db = str(self.tmp / "i.db")
+
+        def run(*words):
+            out = io.StringIO()
+            with mock.patch.object(logging, "basicConfig"):
+                code = self.mod.main(["--db", db, "invite", *words], out=out)
+            return code, out.getvalue()
+        code, said = run("add", "anna")
+        self.assertEqual(code, 0)
+        self.assertIn("invite anna: ", said)
+        self.assertEqual(run("add", "anna")[0], 1)
+        self.assertEqual(run("add", "bob", "my-own-code")[0], 0)
+        code, said = run("list")
+        self.assertIn("anna\tmade", said)
+        self.assertIn("journals 0", said)
+        self.assertEqual(run("revoke", "anna"), (0, "invite anna taken back, 0 journal(s) "
+                                                   "made with it gone\n"))
+        self.assertEqual(run("revoke", "anna")[0], 1)
+        self.assertEqual(run("bogus")[0], 2)
+        run("revoke", "bob")
+        self.assertIn("no invites yet", run("list")[1])
+        with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()), \
+                mock.patch("sys.stderr", io.StringIO()):
+            self.mod.main(["--db", db, "serve-it"])
+        app, _ = self.run_main("--listen", "127.0.0.1:0", "--db", db)
+        self.assertEqual(app.invites(), [])
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch.object(logging, "basicConfig"):
+            self.mod.main(["--db", db, "invite", "list"])  # out: stdout by default
+        self.assertIn("no invites yet", out.getvalue())
 
     def test_version(self):
         out = io.StringIO()
         with redirect_stdout(out), self.assertRaises(SystemExit):
             self.mod.main(["--version"])
-        self.assertIn(f"fedtail-sync {self.mod.__version__} (protocol 1)", out.getvalue())
+        self.assertIn(f"fedtail-sync {self.mod.__version__} (protocol 2)", out.getvalue())
 
 
 if __name__ == "__main__":
