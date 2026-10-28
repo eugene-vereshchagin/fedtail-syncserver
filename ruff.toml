@@ -1,0 +1,7 @@
+# the same rules as fedtail's (pyproject.toml there)
+line-length = 100
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = ["E731"]

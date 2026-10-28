@@ -64,7 +64,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-__version__ = "1.0.0"  # the server's own; it is released apart from fedtail
+__version__ = "0.22.0.dev0"  # the same as fedtail's: they are released together
 VERSION = 1            # the protocol (GET /v1 says it); a client checks this one
 log = logging.getLogger("fedtail-sync")
 

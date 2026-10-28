@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # fedtail-sync faces the internet: its tests, every line of it covered, and a static
+  # check (bandit, ruff's bandit rules) — on the oldest Python it promises too
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install bandit ruff
+      - run: ruff check --output-format=github .
+      - run: bandit -r fedtail_sync.py -ll
+      - run: ruff check --select S --output-format=github fedtail_sync.py
+      - run: python -m unittest discover -v -s tests -t .
+      - if: matrix.python != '3.11'  # sys.monitoring: 3.12+
+        run: python tools/coverage.py --fail-under 100
+
+  # one number with fedtail: this server's version is fedtail's on main
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: eugene-vereshchagin/fedtail
+          path: fedtail
+          sparse-checkout: fedtail/__init__.py
+      - run: python3 tools/same_version.py fedtail/fedtail/__init__.py

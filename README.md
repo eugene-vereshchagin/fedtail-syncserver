@@ -12,7 +12,7 @@ Whose: a device sends a token of its fediverse account limited to `read:accounts
 allows is "who am I") and names its server; fedtail-sync asks that server who the token
 belongs to and files the journal under the answer. No accounts or passwords of its own.
 
-One file, the Python standard library only (3.11+), SQLite. Version 1.0.0, protocol 1
+One file, the Python standard library only (3.11+), SQLite. Versions are fedtail's own (0.22 the first apart), protocol 1
 ([PROTOCOL.md](PROTOCOL.md)); changes — [CHANGELOG.md](CHANGELOG.md). License GPL-3.0-or-later.
 
 ```sh

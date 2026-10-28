@@ -3,8 +3,8 @@ sys.monitoring (3.12+) notes each line the tests run; the lines that could run c
 from the compiled code (co_lines). A line marked "# pragma: no cover" — and the
 block it opens — doesn't count.
 
-    python3 syncserver/tools/coverage.py                  # the report
-    python3 syncserver/tools/coverage.py --fail-under 100 # and exit 1 below that
+    python3 tools/coverage.py                  # the report
+    python3 tools/coverage.py --fail-under 100 # and exit 1 below that
 
 Lines, not branches. The tests run as `unittest discover` would run them.
 """
@@ -14,7 +14,7 @@ import sys
 import unittest
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent.parent  # syncserver/
+HERE = Path(__file__).resolve().parent.parent  # the repository
 TARGET = HERE / "fedtail_sync.py"
 TOOL_ID = 4
 
