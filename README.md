@@ -137,7 +137,7 @@ defaults, but for `client_ip_header`):
 | flood it with requests | `requests_per_minute_per_ip` per address, `requests_per_minute` per account |
 | send random tokens so that it hammers someone's fediverse server with checks | a known token is believed for 10 minutes, a refused one is refused for a minute; real checks are capped per address and in all (`verifications_per_minute_per_ip`, `verifications_per_minute`) |
 | a lying or missing `Content-Length`, a chunked body | refused before reading (411, 400, 413); a body shorter than promised doesn't hold a thread |
-| fill the disk | `quota_mb` per account and `total_mb` for everyone (with `"*"` anyone with a server of their own could make accounts) |
+| fill the disk | each device packs its own journal into a snapshot now and then, dropping its older blobs; `quota_mb` per account and `total_mb` for everyone (with `"*"` anyone with a server of their own could make accounts) |
 | make drafts with pictures in a loop | pictures have a quota of their own (`media_quota_mb`): past it the least used go, so a loop churns only its own pictures — the journal, the other accounts and the disk don't feel it; each at most `max_media_kb`, `media_per_minute` a minute, the same picture stored once, unused ones gone after `media_keep_days` |
 | make it call into your LAN (with `"*"`) | only public addresses, checked on the connected socket — a name that changes its address between the check and the call is caught; no redirect is followed, so the token goes nowhere else |
 | make it show its insides | an error inside answers "internal error"; the details go to its log |

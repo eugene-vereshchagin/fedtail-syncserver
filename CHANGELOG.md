@@ -8,6 +8,9 @@ number (`GET /v1`, [PROTOCOL.md](PROTOCOL.md)) changes only when a client would 
 
 The first version in a repository of its own (until now it came inside fedtail's).
 
+- A device packs its own journal: `DELETE /v1/devices/<device>?before=N` drops that
+  device's blobs older than its snapshot (protocol 1 still — `GET /v1` says `compact`), and
+  the quota they took is free again. The others' blobs are never touched.
 - The pictures of drafts: `PUT` / `GET` / `DELETE /v1/media/<name>` (protocol 1 still —
   `GET /v1` says `media_kb` when the server keeps them). Sealed by the devices like the
   blobs, named by a keyed hash (the same picture stored once). Guarded against a loop of

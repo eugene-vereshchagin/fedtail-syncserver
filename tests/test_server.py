@@ -21,7 +21,8 @@ class JournalTest(Live):
         self.start(quota_mb=1, max_blob_kb=64)
 
     def test_whose_journal_is_whose(self):
-        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1, "media_kb": 4096}))
+        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1, "compact": 1,
+                                                    "media_kb": 4096}))
         self.assertEqual(self.call("GET", "/v1/")[1]["fedtail-sync"], 1)
         self.assertEqual(self.call("GET", "/.well-known/fedtail-sync")[0], 404)  # gone
         self.assertEqual(self.call("POST", "/v1/blobs", "t-me", b"one",
@@ -85,6 +86,32 @@ class JournalTest(Live):
 
     def test_other_methods_arent_served(self):
         self.assertEqual(self.call("PUT", "/v1/blobs", "t-me", b"x")[0], 501)
+
+    def test_a_device_packs_its_own_journal(self):
+        """DELETE /v1/devices/<d>?before=N: that device's blobs older than N go — its
+        snapshot (N and on) says all they did; the others' blobs stay, the quota frees."""
+        for dev, body in (("d1", b"old1"), ("d2", b"theirs"), ("d1", b"old2"),
+                          ("d1", b"snapshot")):
+            self.call("POST", "/v1/blobs", "t-me", body, {"X-Fedtail-Device": dev})
+        used = self.app.used["1@me.example"]
+        self.assertEqual(self.call("DELETE", "/v1/devices/d1?before=4", "t-me"),
+                         (200, {"deleted": 2}))
+        got = self.call("GET", "/v1/blobs?after=0", "t-me")[1]
+        self.assertEqual([(b["seq"], b["device"]) for b in got["blobs"]],
+                         [(2, "d2"), (4, "d1")])
+        self.assertEqual(self.app.used["1@me.example"], used - 8)
+        self.assertEqual(self.call("DELETE", "/v1/devices/d1?before=4", "t-you"),
+                         (200, {"deleted": 0}))  # whose: another account's d1 is not mine
+        self.assertEqual(self.call("DELETE", "/v1/devices/d1", "t-me"),
+                         (200, {"deleted": 0}))  # no before: nothing
+        self.assertEqual(self.call("DELETE", "/v1/devices/bad!?before=4", "t-me")[0], 400)
+        self.assertEqual(self.call("DELETE", "/v1/devices/?before=4", "t-me")[0], 400)
+        self.assertEqual(self.call("DELETE", "/v1/devices/d1?before=x", "t-me")[0], 400)
+        self.assertEqual(self.call("GET", "/v1/devices/d1", "t-me")[0], 501)
+        self.assertEqual(self.call("DELETE", "/v1/devices/d1?before=4")[0], 401)
+        with self.assertRaises(self.mod.Refused) as e:  # checked when called directly too
+            self.app.compact("1@me.example", "", 4)
+        self.assertEqual(e.exception.status, 400)
 
 
 N1, N2, N3 = "a" * 32, "b" * 40, "c" * 64  # pictures' names: the client's keyed hashes
@@ -183,7 +210,7 @@ class MediaTest(Live):
 class NoMediaTest(Live):
     def test_off(self):
         self.start(media_quota_mb=0)
-        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1}))
+        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1, "compact": 1}))
         self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"x")[0], 404)
 
 

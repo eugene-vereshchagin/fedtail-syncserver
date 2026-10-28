@@ -360,6 +360,22 @@ class Server:
                           for s, d, b in rows if not exclude or d != exclude],
                 "last": last, "more": more}
 
+    def compact(self, acc, device, before):
+        """A device's own blobs older than `before` gone: it has just sent everything they
+        said, packed into a snapshot, and wants the old ones off the quota."""
+        if not device or not DEVICE_RE.match(device):
+            raise Refused(HTTPStatus.BAD_REQUEST, "a device id")
+        before = max(0, min(int(before), SEQ_MAX))
+        with self.lock:
+            freed, n = self.db.execute(
+                "SELECT COALESCE(SUM(LENGTH(data)), 0), COUNT(*) FROM blobs "
+                "WHERE account=? AND device=? AND seq<?", (acc, device, before)).fetchone()
+            self.db.execute("DELETE FROM blobs WHERE account=? AND device=? AND seq<?",
+                            (acc, device, before))
+            self.used[acc] = self.used.get(acc, 0) - freed
+            self.total -= freed
+            return n
+
     def wipe(self, acc):
         """The account's journal gone, and its pictures with it."""
         with self.lock:
@@ -558,12 +574,21 @@ class Handler(BaseHTTPRequestHandler):
             q = {k: v[-1] for k, v in parse_qs(url.query, max_num_fields=10).items()}
             self.app.let_in(self.client_ip)
             if method == "GET" and url.path in ("/v1", "/v1/"):
-                hello = {"fedtail-sync": VERSION}
+                hello = {"fedtail-sync": VERSION, "compact": 1}
                 if self.app.media_on():
                     hello["media_kb"] = self.app.cfg["max_media_kb"]
                 return self._send(200, hello)
             if url.path.startswith("/v1/media/"):
                 return self._media(method, url.path[len("/v1/media/"):])
+            if url.path.startswith("/v1/devices/"):
+                if method != "DELETE":
+                    return self._send(501, {"error": "not this method"})
+                device = url.path[len("/v1/devices/"):]
+                if not device or not DEVICE_RE.match(device):  # before the token
+                    raise Refused(HTTPStatus.BAD_REQUEST, "a device id")
+                acc = self.app.account(self.headers, self.client_ip)
+                return self._send(200, {"deleted": self.app.compact(
+                    acc, device, _number(q, "before", 0))})
             if url.path != "/v1/blobs":
                 return self._send(404, {"error": "no such thing"})
             if method == "PUT":

@@ -30,10 +30,11 @@ config (`instances`; `"*"` — any public address).
 
 ### `GET /v1`
 
-`200 {"fedtail-sync": 1, "media_kb": 4096}` — the protocol number, and `media_kb` when the
-server keeps the pictures of drafts (the most one may be, in KB; no key — it doesn't). No
-token needed. A client that finds another number should go no further; one that finds no
-`media_kb` sends no pictures.
+`200 {"fedtail-sync": 1, "compact": 1, "media_kb": 4096}` — the protocol number; `compact`
+when the server takes `DELETE /v1/devices/<device>` (below); `media_kb` when it keeps the
+pictures of drafts (the most one may be, in KB; no key — it doesn't). No token needed. A
+client that finds another number should go no further; one that finds no `media_kb` sends
+no pictures, one that finds no `compact` never packs its journal.
 
 ### `POST /v1/blobs`
 
@@ -62,6 +63,13 @@ included (so a device never asks for its own again); `N` itself when nothing cam
 ### `DELETE /v1/blobs`
 
 The whole journal of the account gone. `200 {"deleted": n}`. The account's pictures go with it.
+
+### `DELETE /v1/devices/<device>?before=N`
+
+That device's blobs with `seq < N` gone — the others' stay. A device calls it right after it
+has sent a snapshot of everything it knows (whose first blob got `seq` N), so its older
+blobs only take up the quota. `200 {"deleted": n}`; no `before` — nothing goes. `<device>` —
+the pattern of `X-Fedtail-Device`, not empty.
 
 ### `PUT /v1/media/<name>`
 
