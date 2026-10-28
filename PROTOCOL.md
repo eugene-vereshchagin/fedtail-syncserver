@@ -30,8 +30,10 @@ config (`instances`; `"*"` — any public address).
 
 ### `GET /v1`
 
-`200 {"fedtail-sync": 1}` — the protocol number. No token needed. A client that finds
-another number should go no further.
+`200 {"fedtail-sync": 1, "media_kb": 4096}` — the protocol number, and `media_kb` when the
+server keeps the pictures of drafts (the most one may be, in KB; no key — it doesn't). No
+token needed. A client that finds another number should go no further; one that finds no
+`media_kb` sends no pictures.
 
 ### `POST /v1/blobs`
 
@@ -59,19 +61,38 @@ included (so a device never asks for its own again); `N` itself when nothing cam
 
 ### `DELETE /v1/blobs`
 
-The whole journal of the account gone. `200 {"deleted": n}`.
+The whole journal of the account gone. `200 {"deleted": n}`. The account's pictures go with it.
+
+### `PUT /v1/media/<name>`
+
+One picture of a draft: raw sealed bytes, an exact `Content-Length`, at most `media_kb`.
+`<name>` — 32 to 64 lowercase hex digits the client makes (fedtail: a keyed hash of the
+picture, so the same picture has the same name and the store learns nothing from it).
+
+`200 {"stored": true}` — kept; `{"stored": false}` — it was there already (not counted
+twice). The account's pictures have a quota of their own: past it the server drops the
+least used ones (put or fetched longest ago) to make room — a client must expect a picture
+to be gone (404) and does without it. Unused for the server's days, a picture goes too.
+
+### `GET /v1/media/<name>`
+
+`200` with the bytes (`application/octet-stream`), or `404`. Fetching it counts as using it.
+
+### `DELETE /v1/media/<name>`
+
+`200 {"deleted": 1}`, or `{"deleted": 0}` — there was none.
 
 ## Statuses
 
 | status | when | what a client does |
 |---|---|---|
 | 200 | done | — |
-| 400 | a bad number, device id, query, empty blob, a body shorter than its length | a bug: report it |
+| 400 | a bad number, device id, picture name, query, empty blob, a body shorter than its length | a bug: report it |
 | 401 | no token, the instance header missing or odd, the token refused by its server | log in again (`fedtail sync login`) |
 | 403 | the instance isn't served here | another sync server |
-| 404 | no such path | not a fedtail-sync |
+| 404 | no such path; no such picture; the server keeps no pictures | not a fedtail-sync; do without the picture |
 | 411 | no `Content-Length`, or a chunked body | send the length |
-| 413 | the blob is over the server's `max_blob_kb` | smaller batches |
+| 413 | the blob is over the server's `max_blob_kb`, the picture over `media_kb` | smaller batches; the picture stays on its device |
 | 429 | too many requests (per address, per account) or token checks | try again in a minute |
 | 501 | another method | — |
 | 502 | the fediverse server didn't answer the token check sensibly | try again later |
@@ -88,3 +109,9 @@ The key is 32 random bytes the account's first device makes and the others are g
 hand; the key id is 8 bytes of a hash of it (a blob sealed by another key is told at once).
 The JSON is `{"v": 1, "d": device, "at": ms, "ops": [...]}`; what the ops are is fedtail's
 business (`fedtail/core/sync/engine.py`) and may grow without a new protocol number.
+
+A picture is sealed the same way, its bytes in place of the zlib'd JSON:
+
+    picture = b"FTM1" | key id (8) | nonce (12) | AES-256-GCM(the file's bytes) — the first 12 bytes as AAD
+
+and named by `HMAC-SHA256(key, b"fedtail-media" | the file's bytes)`, the first 48 hex digits.

@@ -30,9 +30,11 @@ and in all (`verifications_per_minute_per_ip`, `verifications_per_minute`), so i
 be made neither to hang nor to hammer a server; bodies are read only with an honest
 Content-Length; the token check follows no redirect and, for "*", talks only to public
 addresses (checked on the connected socket, not just the name); the disk is capped per
-account (`quota_mb`) and in all (`total_mb`). Behind a proxy on the same machine
-(cloudflared, nginx), `client_ip_header` names the header with the real address —
-believed only from a loopback peer.
+account (`quota_mb`) and in all (`total_mb`); the pictures of drafts have their own
+size, quota and pace (`max_media_kb`, `media_quota_mb`, `media_per_minute`) — past the
+quota the least used ones go, so a loop making drafts churns only its own. Behind a
+proxy on the same machine (cloudflared, nginx), `client_ip_header` names the header with
+the real address — believed only from a loopback peer.
 
 API (JSON; every call but the first needs the token):
 
@@ -41,7 +43,11 @@ API (JSON; every call but the first needs the token):
     GET    /v1/blobs?after=N&limit=M&exclude=DEVICE
                                        {"blobs": [{"seq", "device", "data": base64}],
                                         "last": N, "more": bool}
-    DELETE /v1/blobs                   the account's journal gone → {"deleted": n}
+    DELETE /v1/blobs                   the account's journal (and pictures) gone
+                                       → {"deleted": n}
+    PUT    /v1/media/<name>            body: one sealed picture of a draft → {"stored"}
+    GET    /v1/media/<name>            its bytes
+    DELETE /v1/media/<name>            → {"deleted": 0 | 1}
 """
 
 import argparse
@@ -83,6 +89,13 @@ DEFAULTS = {
     "verifications_per_minute_per_ip": 10,  # token checks at a fediverse server
     "verifications_per_minute": 60,         # … in all
     "client_ip_header": "",     # e.g. "CF-Connecting-IP"; believed from loopback only
+    # the pictures of drafts (sealed like the blobs): one at most max_media_kb; an
+    # account keeps media_quota_mb of them — the least used go first to make room, so no
+    # loop of new drafts fills more; unused media_keep_days — gone; media_per_minute puts
+    "max_media_kb": 4096,
+    "media_quota_mb": 50,       # 0 — no pictures here
+    "media_keep_days": 30,
+    "media_per_minute": 30,     # per account
 }
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS blobs (
@@ -93,6 +106,14 @@ CREATE TABLE IF NOT EXISTS blobs (
     data    BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS blobs_account ON blobs (account, seq);
+CREATE TABLE IF NOT EXISTS media (
+    account TEXT NOT NULL,
+    name    TEXT NOT NULL,
+    at      INTEGER NOT NULL,   -- ms: put or taken last
+    data    BLOB NOT NULL,
+    PRIMARY KEY (account, name)
+);
+CREATE INDEX IF NOT EXISTS media_used ON media (account, at);
 """
 # options of older versions: public_url fed /.well-known/fedtail-sync, gone with
 # fedtail 0.19 (it no longer looks the server up)
@@ -103,6 +124,7 @@ REFUSED_TTL = 60     # a refused one is refused without asking again this long
 PAGE_MAX = 500
 SEQ_MAX = 2 ** 62    # beyond any real sequence; bigger numbers are nonsense
 DEVICE_RE = re.compile(r"^[A-Za-z0-9_-]{0,32}$")
+MEDIA_RE = re.compile(r"^[0-9a-f]{32,64}$")  # a picture's name: the client's keyed hash
 VERIFY_TIMEOUT = 10  # seconds for a fediverse server to say whose a token is
 
 
@@ -226,7 +248,11 @@ class Server:
         # bytes kept: per account and in all (checked on every put without a scan)
         self.used = dict(self.db.execute(
             "SELECT account, SUM(LENGTH(data)) FROM blobs GROUP BY account").fetchall())
-        self.total = sum(self.used.values())
+        self.media_used = dict(self.db.execute(
+            "SELECT account, SUM(LENGTH(data)) FROM media GROUP BY account").fetchall())
+        self.total = sum(self.used.values()) + sum(self.media_used.values())
+        self.media_puts = Window(self.cfg["media_per_minute"])
+        self._media_clock = 0  # ms, never twice the same: the least used is exact
 
     # ---- who is asking ---------------------------------------------------------------
     def allowed_host(self, host):
@@ -335,10 +361,87 @@ class Server:
                 "last": last, "more": more}
 
     def wipe(self, acc):
+        """The account's journal gone, and its pictures with it."""
         with self.lock:
             n = self.db.execute("DELETE FROM blobs WHERE account=?", (acc,)).rowcount
-            self.total -= self.used.pop(acc, 0)
+            self.db.execute("DELETE FROM media WHERE account=?", (acc,))
+            self.total -= self.used.pop(acc, 0) + self.media_used.pop(acc, 0)
             return n
+
+    # ---- the pictures of drafts --------------------------------------------------------
+    def media_on(self):
+        return self.cfg["media_quota_mb"] > 0
+
+    def _media_now(self):
+        """When a picture was last put or taken, in ms (under self.lock)."""
+        self._media_clock = max(int(time.time() * 1000), self._media_clock + 1)
+        return self._media_clock
+
+    def _media_name(self, name):
+        if not self.media_on():
+            raise Refused(HTTPStatus.NOT_FOUND, "no pictures here")
+        if not MEDIA_RE.match(name):
+            raise Refused(HTTPStatus.BAD_REQUEST, "a picture's name: 32 to 64 hex digits")
+
+    def media_put(self, acc, name, data):
+        """One sealed picture under its name. → True: stored; False: it was there (its
+        time touched). Past the account's quota the least used ones go first — a loop of
+        new drafts only ever churns its own pictures."""
+        self._media_name(name)
+        if not data:
+            raise Refused(HTTPStatus.BAD_REQUEST, "an empty picture")
+        quota = self.cfg["media_quota_mb"] * 1024 * 1024
+        if len(data) > self.cfg["max_media_kb"] * 1024 or len(data) > quota:
+            raise Refused(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "the picture is too big")
+        if not self.media_puts.hit(acc):
+            raise Refused(HTTPStatus.TOO_MANY_REQUESTS, "too many pictures, slow down")
+        with self.lock:
+            now = self._media_now()
+            if self.db.execute("UPDATE media SET at=? WHERE account=? AND name=?",
+                               (now, acc, name)).rowcount:
+                return False
+            used = self.media_used.get(acc, 0)
+            while used + len(data) > quota:
+                old, size = self.db.execute(
+                    "SELECT name, LENGTH(data) FROM media WHERE account=? ORDER BY at "
+                    "LIMIT 1", (acc,)).fetchone()
+                self.db.execute("DELETE FROM media WHERE account=? AND name=?", (acc, old))
+                used -= size
+                self.total -= size
+            self.media_used[acc] = used
+            cap = self.cfg["total_mb"] * 1024 * 1024
+            if cap and self.total + len(data) > cap:
+                log.warning("the server is full (total_mb = %d)", self.cfg["total_mb"])
+                raise Refused(HTTPStatus.INSUFFICIENT_STORAGE, "the server is full")
+            self.db.execute("INSERT INTO media (account, name, at, data) VALUES (?, ?, ?, ?)",
+                            (acc, name, now, data))
+            self.media_used[acc] = used + len(data)
+            self.total += len(data)
+            return True
+
+    def media_get(self, acc, name):
+        """The sealed bytes; its time touched (a picture in use doesn't expire)."""
+        self._media_name(name)
+        with self.lock:
+            row = self.db.execute("SELECT data FROM media WHERE account=? AND name=?",
+                                  (acc, name)).fetchone()
+            if row is None:
+                raise Refused(HTTPStatus.NOT_FOUND, "no such picture")
+            self.db.execute("UPDATE media SET at=? WHERE account=? AND name=?",
+                            (self._media_now(), acc, name))
+        return row[0]
+
+    def media_delete(self, acc, name):
+        self._media_name(name)
+        with self.lock:
+            row = self.db.execute("SELECT LENGTH(data) FROM media WHERE account=? AND name=?",
+                                  (acc, name)).fetchone()
+            if row is None:
+                return 0
+            self.db.execute("DELETE FROM media WHERE account=? AND name=?", (acc, name))
+            self.media_used[acc] = self.media_used.get(acc, 0) - row[0]
+            self.total -= row[0]
+            return 1
 
     def expire(self):
         days = self.cfg["keep_days"]
@@ -352,6 +455,17 @@ class Server:
                     self.total = sum(self.used.values())
             if n:
                 log.info("expired %d blobs older than %d days", n, days)
+        days = self.cfg["media_keep_days"]
+        if days:
+            with self.lock:
+                n = self.db.execute("DELETE FROM media WHERE at < ?",  # at: ms
+                                    (int(time.time() * 1000) - days * 86_400_000,)).rowcount
+                if n:
+                    self.media_used = dict(self.db.execute(
+                        "SELECT account, SUM(LENGTH(data)) FROM media GROUP BY account"))
+                    self.total = sum(self.used.values()) + sum(self.media_used.values())
+            if n:
+                log.info("expired %d pictures unused for %d days", n, days)
 
 
 def real_ip(peer, given):
@@ -412,7 +526,16 @@ class Handler(BaseHTTPRequestHandler):
         name = self.app.cfg["client_ip_header"]
         return real_ip(self.client_address[0], self.headers.get(name) if name else None)
 
-    def _body(self):
+    def _bytes(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _body(self, max_kb=None):
         """Exactly Content-Length bytes, or Refused: no length, a strange one, too big,
         or fewer bytes than promised before the timeout."""
         text = self.headers.get("Content-Length")
@@ -421,8 +544,8 @@ class Handler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"\d{1,12}", text.strip()):
             raise Refused(HTTPStatus.BAD_REQUEST, "Content-Length: a number")
         n = int(text)
-        if n > self.app.cfg["max_blob_kb"] * 1024:
-            raise Refused(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "the blob is too big")
+        if n > (max_kb or self.app.cfg["max_blob_kb"]) * 1024:
+            raise Refused(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "the body is too big")
         data = self.rfile.read(n)
         if len(data) != n:
             raise Refused(HTTPStatus.BAD_REQUEST, "the body is shorter than promised")
@@ -435,9 +558,16 @@ class Handler(BaseHTTPRequestHandler):
             q = {k: v[-1] for k, v in parse_qs(url.query, max_num_fields=10).items()}
             self.app.let_in(self.client_ip)
             if method == "GET" and url.path in ("/v1", "/v1/"):
-                return self._send(200, {"fedtail-sync": VERSION})
+                hello = {"fedtail-sync": VERSION}
+                if self.app.media_on():
+                    hello["media_kb"] = self.app.cfg["max_media_kb"]
+                return self._send(200, hello)
+            if url.path.startswith("/v1/media/"):
+                return self._media(method, url.path[len("/v1/media/"):])
             if url.path != "/v1/blobs":
                 return self._send(404, {"error": "no such thing"})
+            if method == "PUT":
+                return self._send(501, {"error": "not this method"})
             acc = self.app.account(self.headers, self.client_ip)
             if method == "POST":
                 blob = self._body()
@@ -451,6 +581,8 @@ class Handler(BaseHTTPRequestHandler):
                                                     _number(q, "limit", 200), exclude))
             return self._send(200, {"deleted": self.app.wipe(acc)})
         except Refused as e:
+            if e.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE:
+                self.close_connection = True  # its body stays unread
             return self._send(e.status, {"error": str(e)})
         except (TimeoutError, ConnectionError):
             self.close_connection = True  # the client went quiet or away: nothing to say
@@ -460,6 +592,20 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("%s %s failed", method, url.path)
             return self._send(500, {"error": "internal error"})
 
+    def _media(self, method, name):
+        """PUT / GET / DELETE /v1/media/<name>: one sealed picture of a draft."""
+        app = self.app
+        app._media_name(name)  # before the token: no checks spent on nonsense
+        acc = app.account(self.headers, self.client_ip)
+        if method == "PUT":
+            return self._send(200, {"stored": app.media_put(
+                acc, name, self._body(app.cfg["max_media_kb"]))})
+        if method == "GET":
+            return self._bytes(app.media_get(acc, name))
+        if method == "DELETE":
+            return self._send(200, {"deleted": app.media_delete(acc, name)})
+        return self._send(501, {"error": "not this method"})
+
     def do_GET(self):  # noqa: N802 — http.server's names
         self._route("GET")
 
@@ -468,6 +614,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):  # noqa: N802
         self._route("DELETE")
+
+    def do_PUT(self):  # noqa: N802
+        self._route("PUT")
 
 
 class HTTPServer(ThreadingHTTPServer):

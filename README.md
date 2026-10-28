@@ -53,6 +53,10 @@ requests_per_minute_per_ip = 240
 verifications_per_minute_per_ip = 10   # token checks at a fediverse server, per address
 verifications_per_minute = 60          # ... in all
 client_ip_header = "CF-Connecting-IP"  # behind cloudflared/nginx on this machine; "" — none
+max_media_kb = 4096           # one picture of a draft (sealed, like the blobs)
+media_quota_mb = 50           # pictures per account; past it the least used go; 0 — none here
+media_keep_days = 30          # a picture unused this long is gone
+media_per_minute = 30         # pictures put per account
 ```
 
 A systemd unit, `/etc/systemd/system/fedtail-sync.service`:
@@ -134,6 +138,7 @@ defaults, but for `client_ip_header`):
 | send random tokens so that it hammers someone's fediverse server with checks | a known token is believed for 10 minutes, a refused one is refused for a minute; real checks are capped per address and in all (`verifications_per_minute_per_ip`, `verifications_per_minute`) |
 | a lying or missing `Content-Length`, a chunked body | refused before reading (411, 400, 413); a body shorter than promised doesn't hold a thread |
 | fill the disk | `quota_mb` per account and `total_mb` for everyone (with `"*"` anyone with a server of their own could make accounts) |
+| make drafts with pictures in a loop | pictures have a quota of their own (`media_quota_mb`): past it the least used go, so a loop churns only its own pictures — the journal, the other accounts and the disk don't feel it; each at most `max_media_kb`, `media_per_minute` a minute, the same picture stored once, unused ones gone after `media_keep_days` |
 | make it call into your LAN (with `"*"`) | only public addresses, checked on the connected socket — a name that changes its address between the check and the call is caught; no redirect is followed, so the token goes nowhere else |
 | make it show its insides | an error inside answers "internal error"; the details go to its log |
 

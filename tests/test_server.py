@@ -21,8 +21,8 @@ class JournalTest(Live):
         self.start(quota_mb=1, max_blob_kb=64)
 
     def test_whose_journal_is_whose(self):
-        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1}))
-        self.assertEqual(self.call("GET", "/v1/"), (200, {"fedtail-sync": 1}))
+        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1, "media_kb": 4096}))
+        self.assertEqual(self.call("GET", "/v1/")[1]["fedtail-sync"], 1)
         self.assertEqual(self.call("GET", "/.well-known/fedtail-sync")[0], 404)  # gone
         self.assertEqual(self.call("POST", "/v1/blobs", "t-me", b"one",
                                    {"X-Fedtail-Device": "d1"}), (200, {"seq": 1}))
@@ -85,6 +85,106 @@ class JournalTest(Live):
 
     def test_other_methods_arent_served(self):
         self.assertEqual(self.call("PUT", "/v1/blobs", "t-me", b"x")[0], 501)
+
+
+N1, N2, N3 = "a" * 32, "b" * 40, "c" * 64  # pictures' names: the client's keyed hashes
+
+
+class MediaTest(Live):
+    """The pictures of drafts: sealed bytes under a name; a quota of their own where the
+    least used go first, so a loop of new drafts can't fill the disk or lock the
+    account's journal; a pace, a size, an age."""
+
+    def setUp(self):
+        super().setUp()
+        self.start(quota_mb=1, max_blob_kb=64, max_media_kb=100, media_quota_mb=1,
+                   media_per_minute=1000)
+
+    def test_put_get_delete(self):
+        self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"pic1"),
+                         (200, {"stored": True}))
+        self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"pic1"),
+                         (200, {"stored": False}))  # there already: counted once
+        self.assertEqual(self.call("GET", f"/v1/media/{N1}", "t-me"), (200, b"pic1"))
+        self.assertEqual(self.call("GET", f"/v1/media/{N1}", "t-you")[0], 404)  # whose
+        self.assertEqual(self.call("DELETE", f"/v1/media/{N1}", "t-me"),
+                         (200, {"deleted": 1}))
+        self.assertEqual(self.call("DELETE", f"/v1/media/{N1}", "t-me"),
+                         (200, {"deleted": 0}))
+        self.assertEqual(self.call("GET", f"/v1/media/{N1}", "t-me")[0], 404)
+        self.assertEqual(self.app.media_used["1@me.example"], 0)
+
+    def test_names_sizes_methods_and_tokens(self):
+        self.assertEqual(self.call("PUT", "/v1/media/NOTHEX", "t-me", b"x")[0], 400)
+        self.assertEqual(len(self.calls), 0)  # nonsense costs no token check
+        self.assertEqual(self.call("PUT", f"/v1/media/{N1}", None, b"x")[0], 401)
+        self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"")[0], 400)
+        self.assertEqual(self.call("PUT", f"/v1/media/{N2}", "t-me", b"x" * 101 * 1024)[0],
+                         413)
+        self.assertEqual(self.call("POST", f"/v1/media/{N1}", "t-me", b"x")[0], 501)
+        with self.assertRaises(self.mod.Refused) as e:  # the size, when called directly
+            self.app.media_put("1@me.example", N3, b"x" * 101 * 1024)
+        self.assertEqual(e.exception.status, 413)
+
+    def test_a_loop_of_drafts_churns_only_its_own(self):
+        """1 MB of pictures at most: the 11th of 100 KB pushes out the least used — the
+        journal and the other accounts don't feel it."""
+        for i in range(11):
+            name = f"{i:032x}"
+            self.assertEqual(self.call("PUT", f"/v1/media/{name}", "t-me",
+                                       b"p" * 100 * 1024)[0], 200)
+            if i == 9:  # the first one used again: the second is now the least used
+                self.call("GET", f"/v1/media/{0:032x}", "t-me")
+        self.assertLessEqual(self.app.media_used["1@me.example"], 1024 * 1024)
+        self.assertEqual(self.call("GET", f"/v1/media/{0:032x}", "t-me")[0], 200)
+        self.assertEqual(self.call("GET", f"/v1/media/{1:032x}", "t-me")[0], 404)  # gone
+        self.assertEqual(self.call("POST", "/v1/blobs", "t-me", b"journal")[0], 200)
+        self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-you", b"theirs")[0], 200)
+
+    def test_the_whole_server_full(self):
+        self.app.cfg["total_mb"] = 1
+        self.app.total = 1024 * 1024
+        self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"x")[0], 507)
+
+    def test_the_pace(self):
+        self.app.media_puts = self.mod.Window(2)
+        for i in range(2):
+            self.assertEqual(self.call("PUT", f"/v1/media/{i:032x}", "t-me", b"x")[0], 200)
+        self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"x")[0], 429)
+
+    def test_the_journal_wiped_takes_its_pictures(self):
+        self.call("PUT", f"/v1/media/{N1}", "t-me", b"pic")
+        self.call("POST", "/v1/blobs", "t-me", b"one")
+        self.assertEqual(self.call("DELETE", "/v1/blobs", "t-me"), (200, {"deleted": 1}))
+        self.assertEqual(self.call("GET", f"/v1/media/{N1}", "t-me")[0], 404)
+        self.assertEqual(self.app.total, 0)
+
+    def test_unused_pictures_expire(self):
+        self.call("PUT", f"/v1/media/{N1}", "t-me", b"old")
+        self.call("PUT", f"/v1/media/{N2}", "t-me", b"new")
+        self.app.db.execute("UPDATE media SET at = at - 40 * 86400000 WHERE name=?", (N1,))
+        self.app.expire()
+        self.assertEqual(self.call("GET", f"/v1/media/{N1}", "t-me")[0], 404)
+        self.assertEqual(self.call("GET", f"/v1/media/{N2}", "t-me")[0], 200)
+        self.assertEqual(self.app.total, 3)
+        self.app.cfg["media_keep_days"] = 0
+        self.app.expire()  # 0: kept until deleted
+        self.assertEqual(self.call("GET", f"/v1/media/{N2}", "t-me")[0], 200)
+
+    def test_counted_again_at_start(self):
+        self.call("PUT", f"/v1/media/{N1}", "t-me", b"pic")
+        again = self.mod.Server({"db": str(self.tmp / "s.db"), "instances": ["me.example"]},
+                                verify=lambda h, t: None)
+        self.addCleanup(again.db.close)
+        self.assertEqual(again.media_used, {"1@me.example": 3})
+        self.assertEqual(again.total, 3)
+
+
+class NoMediaTest(Live):
+    def test_off(self):
+        self.start(media_quota_mb=0)
+        self.assertEqual(self.call("GET", "/v1"), (200, {"fedtail-sync": 1}))
+        self.assertEqual(self.call("PUT", f"/v1/media/{N1}", "t-me", b"x")[0], 404)
 
 
 class AccountLimitTest(Live):
