@@ -47,8 +47,9 @@ API (JSON; PROTOCOL.md — every call but the first two names its journal):
     PUT    /v2/media/<name>            body: one sealed picture of a draft → {"stored"}
     GET    /v2/media/<name>            its bytes
     DELETE /v2/media/<name>            → {"deleted": 0 | 1}
-    PUT    /v2/escrow/<id>             the key sealed by a password (one per journal)
-    GET    /v2/escrow/<id>             its bytes — no journal named: that's what it's for
+    PUT    /v2/escrow                  the key sealed by a password (one per journal),
+                                       its id in X-Fedtail-Escrow (never in the URL)
+    GET    /v2/escrow                  its bytes — no journal named: that's what it's for
 """
 
 import argparse
@@ -84,7 +85,10 @@ DEFAULTS = {
     "max_connections": 64,      # served at once; more are closed at the door
     "requests_per_minute_per_ip": 240,
     "new_journals_per_minute_per_ip": 3,   # journals made (each needs an invite code)
-    "escrow_gets_per_minute_per_ip": 5,    # the key under a password asked for
+    "escrow_gets_per_minute_per_ip": 5,    # the key under a password asked for (an
+                                           # IPv6 address counts by its /64)
+    "escrow_gets_per_minute": 60,          # …by everyone together; 0 — no cap
+    "journals_per_invite": 5,              # journals one invite code may make; 0 — any
     "client_ip_header": "",     # e.g. "CF-Connecting-IP"; believed from loopback only
     # the pictures of drafts (sealed like the blobs): one at most max_media_kb; an
     # account keeps media_quota_mb of them — the least used go first to make room, so no
@@ -206,6 +210,7 @@ class Server:
         self.per_ip = Window(self.cfg["requests_per_minute_per_ip"])
         self.new_journals = Window(self.cfg["new_journals_per_minute_per_ip"])
         self.escrow_gets = Window(self.cfg["escrow_gets_per_minute_per_ip"])
+        self.escrow_gets_all = Window(self.cfg["escrow_gets_per_minute"])
         # bytes kept: per journal and in all (checked on every put without a scan)
         self.used = dict(self.db.execute(
             "SELECT account, SUM(LENGTH(data)) FROM blobs GROUP BY account").fetchall())
@@ -283,8 +288,16 @@ class Server:
                                   (_hash(_code_of(code)),)).fetchone()
             if row is None:
                 raise Refused(HTTPStatus.FORBIDDEN, "no such invite code (or taken back)")
+            most = self.cfg["journals_per_invite"]
+            if most and self.db.execute("SELECT COUNT(*) FROM journals WHERE invite=?",
+                                        (row[0],)).fetchone()[0] >= most:
+                raise Refused(HTTPStatus.FORBIDDEN, "this invite code has made all the "
+                                                    "journals it may")
             self.db.execute("INSERT OR IGNORE INTO journals VALUES (?, ?, ?, ?)",
                             (jid, _hash(secret), row[0], int(time.time())))
+            got = self.db.execute("SELECT secret FROM journals WHERE id=?", (jid,)).fetchone()
+        if not secrets.compare_digest(got[0], _hash(secret)):  # made at once by another
+            raise Refused(HTTPStatus.UNAUTHORIZED, "not this journal's secret")
         log.info("a journal made with the invite %s", row[0])
 
     # ---- the journal -----------------------------------------------------------------
@@ -354,13 +367,17 @@ class Server:
     # ---- the key under a password ------------------------------------------------------
     def escrow_put(self, acc, eid, data):
         """The journal's key sealed by a password, under an id the client derived from
-        the password: one per journal, a new one replaces it."""
+        the password and the account: one per journal, a new one replaces the journal's
+        own — never another journal's (409): an id guessed can't take one's place."""
         if not ESCROW_RE.match(eid):
             raise Refused(HTTPStatus.BAD_REQUEST, "an escrow id: 64 hex digits")
         if not data or len(data) > ESCROW_MAX:
             raise Refused(HTTPStatus.BAD_REQUEST, "a key under a password: 1…4096 bytes")
         with self.lock:
-            self.db.execute("DELETE FROM escrow WHERE journal=? OR id=?", (acc, eid))
+            row = self.db.execute("SELECT journal FROM escrow WHERE id=?", (eid,)).fetchone()
+            if row is not None and row[0] != acc:
+                raise Refused(HTTPStatus.CONFLICT, "this id is another journal's")
+            self.db.execute("DELETE FROM escrow WHERE journal=?", (acc,))
             self.db.execute("INSERT INTO escrow VALUES (?, ?, ?)", (eid, acc, data))
         return True
 
@@ -369,7 +386,7 @@ class Server:
         id is all there is, so asking is slow per address."""
         if not ESCROW_RE.match(eid):
             raise Refused(HTTPStatus.BAD_REQUEST, "an escrow id: 64 hex digits")
-        if not self.escrow_gets.hit(ip):
+        if not self.escrow_gets.hit(network(ip)) or not self.escrow_gets_all.hit("*"):
             raise Refused(HTTPStatus.TOO_MANY_REQUESTS, "too many tries, later")
         with self.lock:
             row = self.db.execute("SELECT data FROM escrow WHERE id=?", (eid,)).fetchone()
@@ -461,7 +478,7 @@ class Server:
                 if n:
                     self.used = dict(self.db.execute(
                         "SELECT account, SUM(LENGTH(data)) FROM blobs GROUP BY account"))
-                    self.total = sum(self.used.values())
+                    self.total = sum(self.used.values()) + sum(self.media_used.values())
             if n:
                 log.info("expired %d blobs older than %d days", n, days)
         days = self.cfg["media_keep_days"]
@@ -475,6 +492,20 @@ class Server:
                     self.total = sum(self.used.values()) + sum(self.media_used.values())
             if n:
                 log.info("expired %d pictures unused for %d days", n, days)
+
+
+def network(ip):
+    """What a limit counts an address by: an IPv6 address by its /64 (one machine is
+    given a whole /64), any other as it is."""
+    try:
+        addr = ipaddress.ip_address(str(ip).split("%", 1)[0])
+    except ValueError:
+        return str(ip)
+    if addr.version == 6:
+        if addr.ipv4_mapped:  # ::ffff:a.b.c.d — an IPv4 address, counted as one
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{addr}/64", strict=False))
+    return str(addr)
 
 
 def real_ip(peer, given):
@@ -576,8 +607,9 @@ class Handler(BaseHTTPRequestHandler):
             if not path.startswith("/v2/"):
                 return self._send(404, {"error": "no such thing (protocol 2: /v2)"})
             path = path[len("/v2"):]
-            if path.startswith("/escrow/"):
-                return self._escrow(method, path[len("/escrow/"):])
+            if path == "/escrow":
+                return self._escrow(method, (self.headers.get("X-Fedtail-Escrow") or "")
+                                    .strip().lower())
             if path.startswith("/media/"):
                 return self._media(method, path[len("/media/"):])
             if path.startswith("/devices/"):
@@ -618,7 +650,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": "internal error"})
 
     def _escrow(self, method, eid):
-        """PUT (a device of the journal) / GET (anyone with the id) /v2/escrow/<id>."""
+        """PUT (a device of the journal) / GET (anyone with the id) /v2/escrow, the id in
+        X-Fedtail-Escrow: a header, so no log of a request line holds it."""
         app = self.app
         if method == "GET":
             return self._bytes(app.escrow_get(eid, self.client_ip))

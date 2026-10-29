@@ -25,7 +25,7 @@ A journal is its key's: the devices that share the key derive from it
     secret     = HMAC-SHA256(key, b"fedtail-journal-secret"), 64 hex digits
 
 and the key itself never comes to the server. Every call but `GET /v2` and
-`GET /v2/escrow/<id>` carries:
+`GET /v2/escrow` carries:
 
 | header | what |
 |---|---|
@@ -85,18 +85,25 @@ has sent a snapshot of everything it knows (whose first blob got `seq` N), so it
 blobs only take up the quota. `200 {"deleted": n}`; no `before` — nothing goes. `<device>` —
 the pattern of `X-Fedtail-Device`, not empty.
 
-### `PUT /v2/escrow/<id>` · `GET /v2/escrow/<id>`
+### `PUT /v2/escrow` · `GET /v2/escrow`
 
-The journal's key sealed by a password (fedtail: `FTK1`, below), so that a new device with
-only the password takes it. `<id>` — 64 hex digits the client derives from the password
-alone:
+The journal's key sealed by a password (fedtail: `FTK2`, below), so that a new device with
+only the password and its fediverse account takes it. The id, in the header
+`X-Fedtail-Escrow` (never in the URL, so no request line in a log holds it) — 64 hex digits
+the client derives from the password and the account:
 
     id = scrypt(password, salt = b"fedtail-escrow-id:" + the server's address, lowercase,
-                no trailing "/", n = 2**15, r = 8, p = 1, 32 bytes), hex
+                no trailing "/" + b"\n" + the account, "user@host" lowercase,
+                n = 2**17, r = 8, p = 1, 32 bytes), hex
+
+The account in it makes each id one person's: a guess of a password tests one account,
+not everyone on the server, and two people with the same password don't meet.
 
 `PUT` (a device of the journal; body at most 4096 bytes) → `200 {"stored": true}`; one per
-journal — a new one replaces it. `GET` names no journal: `200` with the bytes, or `404`;
-asked at most `escrow_gets_per_minute_per_ip`.
+journal — a new one replaces the journal's own; an id held by another journal → `409`.
+`GET` names no journal: `200` with the bytes, or `404`; asked at most
+`escrow_gets_per_minute_per_ip` (an IPv6 address counts by its /64) and
+`escrow_gets_per_minute` by everyone together.
 
 ### `PUT /v2/media/<name>`
 
@@ -124,8 +131,9 @@ to be gone (404) and does without it. Unused for the server's days, a picture go
 | 200 | done | — |
 | 400 | a bad number, device id, picture name, escrow id, query, empty blob, a body shorter than its length | a bug: report it |
 | 401 | no journal named, an odd id or secret, not this journal's secret | the key isn't this journal's |
-| 403 | a new journal without an invite code, a code not known (or taken back) | ask for an invite code |
+| 403 | a new journal without an invite code, a code not known (or taken back), a code that has made all the journals it may (`journals_per_invite`) | ask for an invite code |
 | 404 | no such path; no such picture or key under a password; the server keeps no pictures | not a fedtail-sync 0.22; do without it |
+| 409 | a key under a password put under an id another journal holds | another password |
 | 411 | no `Content-Length`, or a chunked body | send the length |
 | 413 | the blob is over the server's `max_blob_kb`, the picture over `media_kb`, the key over 4 KB | smaller batches; the picture stays on its device |
 | 429 | too many requests (per address, per journal), new journals, keys asked for | try again in a minute |
@@ -152,6 +160,7 @@ and named by `HMAC-SHA256(key, b"fedtail-media" | the file's bytes)`, the first 
 
 The key under a password:
 
-    escrow = b"FTK1" | salt (16) | nonce (12) | AES-256-GCM(the key) — the first 20 bytes as AAD
+    escrow = b"FTK2" | salt (16) | nonce (12) | AES-256-GCM(the key) — the first 20 bytes as AAD
 
-sealed by `scrypt(password, salt, n = 2**15, r = 8, p = 1, 32 bytes)`.
+sealed by `scrypt(password, salt, n = 2**17, r = 8, p = 1, 32 bytes)` (`FTK1`, from
+fedtail 0.21 in a folder's journal: the same with `n = 2**15` — opened, never made).

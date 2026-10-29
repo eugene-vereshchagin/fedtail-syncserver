@@ -17,8 +17,13 @@ The first version in a repository of its own (until now it came inside fedtail's
   `new_journals_per_minute_per_ip`. `invite add <name> [code]`, `invite list`,
   `invite revoke <name>` on the command line; a code is shown once, only its hash kept;
   taken back, it takes the journals made with it away.
-- The key under a password apart from the journal: `PUT/GET /v2/escrow/<id>`, the id
-  derived from the password, asked at most `escrow_gets_per_minute_per_ip`.
+- The key under a password apart from the journal: `PUT/GET /v2/escrow`, its id in
+  `X-Fedtail-Escrow` (never in a URL a log keeps), derived from the password and the
+  fediverse account (one person's: a guess tests one, not everyone); asked at most
+  `escrow_gets_per_minute_per_ip` (an IPv6 /64 counts as one) and
+  `escrow_gets_per_minute` by everyone together; an id another journal holds is refused
+  (409).
+- `journals_per_invite` (5): one invite code makes at most so many journals.
 - The journals of protocol 1 are dropped at the first start.
 - A device packs its own journal: `DELETE /v1/devices/<device>?before=N` drops that
   device's blobs older than its snapshot (protocol 1 still — `GET /v1` says `compact`), and

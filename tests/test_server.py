@@ -12,7 +12,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from .live import ME, YOU, Live, Tmp, creds
+from .live import CODE, ME, YOU, Live, Tmp, creds
 
 
 class JournalTest(Live):
@@ -265,14 +265,15 @@ class InviteTest(Live):
         self.assertNotIn(anna, str(self.app.db.execute("SELECT * FROM invites").fetchall()))
         self.call("POST", "/v1/blobs", "t-me", b"mine")              # with CODE ("tests")
         self.call("POST", "/v1/blobs", "t-you", b"hers", invite=anna)
-        self.call("PUT", "/v1/escrow/" + "e" * 64, "t-you", b"her key")
+        self.call("PUT", "/v2/escrow", "t-you", b"her key", headers={"X-Fedtail-Escrow": "e" * 64})
         self.assertEqual([(n, j) for n, _m, j in self.app.invites()],
                          [("anna", 1), ("tests", 1)])
         self.assertEqual(self.app.invite_revoke("anna"), 1)
         self.assertIsNone(self.app.invite_revoke("anna"))
         self.assertEqual(self.call("GET", "/v1/blobs", "t-you", invite=None)[0], 403)
         self.assertEqual(self.call("GET", "/v1/blobs", "t-you", invite=anna)[0], 403)
-        self.assertEqual(self.call("GET", "/v2/escrow/" + "e" * 64)[0], 404)
+        self.assertEqual(self.call("GET", "/v2/escrow", headers={"X-Fedtail-Escrow": "e" * 64})[0],
+                         404)
         self.assertNotIn(YOU, self.app.used)
         self.assertEqual(len(self.call("GET", "/v1/blobs", "t-me")[1]["blobs"]), 1)
 
@@ -281,6 +282,37 @@ class InviteTest(Live):
         self.assertEqual(self.call("GET", "/v1/blobs", "t-me")[0], 200)
         self.assertEqual(self.call("GET", "/v1/blobs", "t-you")[0], 429)
         self.assertEqual(self.call("GET", "/v1/blobs", "t-me")[0], 200)  # made: no pace
+
+    def test_one_code_makes_so_many_journals(self):
+        """journals_per_invite: a code given to one person can't fill the server with
+        journals (each has its quota); the journals it made go on working."""
+        self.start(journals_per_invite=1)
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-me")[0], 200)
+        got = self.call("GET", "/v1/blobs", "t-you")
+        self.assertEqual(got[0], 403)
+        self.assertIn("all the journals", got[1]["error"])
+        self.assertEqual(self.call("GET", "/v1/blobs", "t-me")[0], 200)
+
+    def test_two_at_once_one_journal(self):
+        """Made at the same moment by two with different secrets: the second is told it
+        isn't this journal's, not let in."""
+        self.start()
+        self.app.account({"Authorization": "Bearer " + "1" * 64, "X-Fedtail-Journal": "a" * 32,
+                          "X-Fedtail-Invite": CODE})
+        real = self.app.db.execute
+        calls = []
+
+        def racing(sql, args=()):  # someone else's row lands between the look and the insert
+            if sql.startswith("INSERT OR IGNORE INTO journals") and not calls:
+                calls.append(1)
+                real("INSERT INTO journals VALUES (?, ?, ?, ?)",
+                     ("b" * 32, self.mod._hash("2" * 64), "tests", 0))
+            return real(sql, args)
+        self.app.db = type("Db", (), {"execute": staticmethod(racing),
+                                      "close": real.__self__.close})()
+        with self.assertRaises(self.mod.Refused) as e:
+            self.app._make("b" * 32, "3" * 64, CODE, "?")
+        self.assertEqual(e.exception.status, 401)
 
     def test_protocol_1_journals_go_at_start(self):
         self.start()
@@ -301,16 +333,23 @@ class EscrowTest(Live):
     def test_put_and_taken(self):
         self.start(escrow_gets_per_minute_per_ip=2)
         eid = "e" * 64
-        self.assertEqual(self.call("PUT", f"/v2/escrow/{eid}", "t-me", b"sealed"),
-                         (200, {"stored": True}))
-        self.assertEqual(self.call("GET", f"/v2/escrow/{eid}"), (200, b"sealed"))
-        self.call("PUT", "/v2/escrow/" + "f" * 64, "t-me", b"anew")  # one per journal
-        self.assertEqual(self.call("GET", f"/v2/escrow/{eid}")[0], 404)
-        self.assertEqual(self.call("GET", "/v2/escrow/" + "f" * 64)[0], 429)  # the 3rd
-        self.assertEqual(self.call("GET", "/v2/escrow/nothex")[0], 400)
-        self.assertEqual(self.call("PUT", "/v2/escrow/" + "f" * 64, None, b"x")[0], 401)
-        self.assertEqual(self.call("DELETE", f"/v2/escrow/{eid}", "t-me")[0], 501)
-        self.assertEqual(self.call("PUT", f"/v2/escrow/{eid}", "t-me", b"x" * 5000)[0], 413)
+
+        def esc(method, eid, token=None, body=None):
+            return self.call(method, "/v2/escrow", token, body,
+                             headers={"X-Fedtail-Escrow": eid} if eid is not None else {})
+        self.assertEqual(esc("PUT", eid, "t-me", b"sealed"), (200, {"stored": True}))
+        self.assertEqual(esc("GET", eid), (200, b"sealed"))
+        # another journal can't take its place under the same id (a guessed one)
+        self.assertEqual(esc("PUT", eid, "t-you", b"theirs")[0], 409)
+        esc("PUT", "f" * 64, "t-me", b"anew")  # one per journal: the old id goes
+        self.assertEqual(esc("GET", eid)[0], 404)
+        self.assertEqual(esc("GET", "f" * 64)[0], 429)  # the 3rd from this address
+        self.assertEqual(esc("GET", "nothex")[0], 400)
+        self.assertEqual(esc("GET", None)[0], 400)  # no id: the header is the place
+        self.assertEqual(self.call("GET", "/v2/escrow/" + "f" * 64)[0], 404)  # not the URL
+        self.assertEqual(esc("PUT", "f" * 64, None, b"x")[0], 401)
+        self.assertEqual(esc("DELETE", eid, "t-me")[0], 501)
+        self.assertEqual(esc("PUT", eid, "t-me", b"x" * 5000)[0], 413)
         for bad in ((ME, "nothex", b"x"), (ME, eid, b"")):
             with self.assertRaises(self.mod.Refused) as e:
                 self.app.escrow_put(*bad)
@@ -320,6 +359,18 @@ class EscrowTest(Live):
         self.call("DELETE", "/v1/blobs", "t-me")  # the journal wiped: its key under a
         self.assertEqual(self.app.db.execute(  # password with it
             "SELECT COUNT(*) FROM escrow").fetchone()[0], 0)
+
+    def test_asked_slowly_by_everyone_together(self):
+        """Not only per address: an IPv6 /64 is one, and all the askers together have a
+        ceiling of their own (many addresses can't sweep the ids)."""
+        self.start(escrow_gets_per_minute_per_ip=100, escrow_gets_per_minute=2)
+        for _ in range(2):
+            with self.assertRaises(self.mod.Refused) as e:
+                self.app.escrow_get("a" * 64, "2001:db8::1")
+            self.assertEqual(e.exception.status, 404)
+        with self.assertRaises(self.mod.Refused) as e:
+            self.app.escrow_get("a" * 64, "198.51.100.7")  # another address: still no
+        self.assertEqual(e.exception.status, 429)
 
 
 class NamesTest(Tmp):
@@ -331,6 +382,15 @@ class NamesTest(Tmp):
         self.assertEqual(r("127.0.0.1", "nonsense"), "127.0.0.1")
         self.assertEqual(r("127.0.0.1", None), "127.0.0.1")
         self.assertEqual(r("/run/sync.sock", "198.51.100.1"), "/run/sync.sock")  # no IP
+
+    def test_what_a_limit_counts_by(self):
+        n = self.mod.network
+        self.assertEqual(n("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::/64")
+        self.assertEqual(n("2001:db8:1:2::9"), n("2001:db8:1:2:ffff::1"))  # one /64
+        self.assertEqual(n("::ffff:198.51.100.7"), "198.51.100.7")
+        self.assertEqual(n("198.51.100.7"), "198.51.100.7")
+        self.assertEqual(n("fe80::1%eth0"), "fe80::/64")
+        self.assertEqual(n("/run/sync.sock"), "/run/sync.sock")
 
 
 class ExpireTest(Tmp):

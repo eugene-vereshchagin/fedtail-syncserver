@@ -55,7 +55,9 @@ timeout_seconds = 30          # a silent connection is dropped (a whole request:
 max_connections = 64          # served at once; more are closed at the door
 requests_per_minute_per_ip = 240
 new_journals_per_minute_per_ip = 3    # journals made (each needs an invite code)
-escrow_gets_per_minute_per_ip = 5     # the key under a password asked for
+escrow_gets_per_minute_per_ip = 5     # the key under a password asked for (IPv6: per /64)
+escrow_gets_per_minute = 60           # …by everyone together; 0 — no cap
+journals_per_invite = 5               # journals one invite code may make; 0 — any
 client_ip_header = "CF-Connecting-IP"  # behind cloudflared/nginx on this machine; "" — none
 max_media_kb = 4096           # one picture of a draft (sealed, like the blobs)
 media_quota_mb = 50           # pictures per journal; past it the least used go; 0 — none here
@@ -156,9 +158,10 @@ defaults, but for `client_ip_header`):
 | open connections and stay silent, or trickle a byte now and then | dropped after `timeout_seconds` of silence; a whole request gets twice that |
 | open thousands of connections | `max_connections` at once; the rest are closed at the door |
 | flood it with requests | `requests_per_minute_per_ip` per address, `requests_per_minute` per journal |
-| make journals of their own and fill the disk | a journal is made only with an invite code (`invite add`), at most `new_journals_per_minute_per_ip`; a code taken back takes its journals with it |
+| make journals of their own and fill the disk | a journal is made only with an invite code (`invite add`), at most `new_journals_per_minute_per_ip`, at most `journals_per_invite` per code; a code taken back takes its journals with it |
 | guess someone's journal | its id and secret are derived from a 256-bit key: nothing to guess; each try counts against the address and the journal |
-| guess a password for the key kept under it | the id it is kept under is stretched from the password (scrypt), and asking is slow: `escrow_gets_per_minute_per_ip` |
+| guess a password for the key kept under it | the id it is kept under is stretched (scrypt, 128 MB a guess) from the password *and the fediverse account*, so a guess tests one person, not everyone here; it travels in a header, never in a logged URL; asking is slow per address (an IPv6 /64 is one) and for everyone together: `escrow_gets_per_minute_per_ip`, `escrow_gets_per_minute` |
+| put their key in place of someone's | an id another journal holds is refused (409): a journal replaces only its own |
 | a lying or missing `Content-Length`, a chunked body | refused before reading (411, 400, 413); a body shorter than promised doesn't hold a thread |
 | fill the disk | each device packs its own journal into a snapshot now and then, dropping its older blobs; `quota_mb` per journal and `total_mb` for everyone |
 | make drafts with pictures in a loop | pictures have a quota of their own (`media_quota_mb`): past it the least used go, so a loop churns only its own pictures — the journal, the other journals and the disk don't feel it; each at most `max_media_kb`, `media_per_minute` a minute, the same picture stored once, unused ones gone after `media_keep_days` |
