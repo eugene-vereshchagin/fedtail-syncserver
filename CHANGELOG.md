@@ -4,7 +4,7 @@ The server's versions are fedtail's: one number for both, released together (a v
 fedtail-sync with nothing new in it is the same server under the new number). The protocol
 number (`GET /v1`, [PROTOCOL.md](PROTOCOL.md)) changes only when a client would have to.
 
-## 0.22.0 — in progress
+## 0.22.0 — 2026-10-30
 
 The first version in a repository of its own (until now it came inside fedtail's).
 
