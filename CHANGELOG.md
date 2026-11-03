@@ -4,7 +4,10 @@ The server's versions are fedtail's: one number for both, released together (a v
 fedtail-sync with nothing new in it is the same server under the new number). The protocol
 number (`GET /v1`, [PROTOCOL.md](PROTOCOL.md)) changes only when a client would have to.
 
-## 0.22.3 — in progress
+## 0.22.3 — 2026-11-03
+
+Nothing new in the server: the same one under fedtail 0.22.3's number (the update check,
+sync's set-up and "a device joined" are fedtail's side; protocol 2 as before).
 
 ## 0.22.2 — 2026-11-02
 
