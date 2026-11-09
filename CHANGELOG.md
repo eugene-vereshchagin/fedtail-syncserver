@@ -4,7 +4,11 @@ The server's versions are fedtail's: one number for both, released together (a v
 fedtail-sync with nothing new in it is the same server under the new number). The protocol
 number (`GET /v1`, [PROTOCOL.md](PROTOCOL.md)) changes only when a client would have to.
 
-## What's next
+## 0.22.4 — 2026-11-09
+
+Nothing new in the server: the same one under fedtail 0.22.4's number (the phone on
+Android 11, a picture's and a post's look-up, tags' menus are fedtail's side; protocol 2 as
+before).
 
 ## 0.22.3 — 2026-11-03
 
