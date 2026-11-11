@@ -6,6 +6,11 @@ number (`GET /v1`, [PROTOCOL.md](PROTOCOL.md)) changes only when a client would 
 
 ## What's next
 
+## 0.22.9 — 2026-11-11
+
+Nothing new in the server: the same one under fedtail 0.22.9's number (changes on
+fedtail's side; protocol 2 as before).
+
 ## 0.22.8 — 2026-11-11
 
 Nothing new in the server: the same one under fedtail 0.22.8's number (changes on
